@@ -1,0 +1,21 @@
+[
+  {
+    "id": "f802c2ca-df87-4cb3-9c32-2c12170223f5",
+    "scania_id": "SCN121422",
+    "email": "u01913310170@scania-member.com",
+    "full_name": "সদস্য 0170",
+    "phone": "01913310170",
+    "canonical_digits": "01913310170",
+    "password_salt": "174bfc1365d5ee5fa0ef63e3c1435e23",
+    "password_hash": "099e5a5fa2c53ce8bddc155ab4b9cadff52bcf81ccb7ecfb08e1c58b47c33bde6c7e506eec647b42973ff516541fe22ac0c68d74c1991fcc6814060f7c49dd84",
+    "avatar_url": "",
+    "tier": "Standard",
+    "demo_balance": 100,
+    "demo_bonus": 50,
+    "referral_code": "SCNF802C2",
+    "referred_by": null,
+    "is_active": true,
+    "created_at": "2026-11-19T06:52:41.646Z",
+    "updated_at": "2026-11-19T06:52:41.646Z"
+  }
+]
