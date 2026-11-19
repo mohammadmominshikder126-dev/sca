@@ -149,7 +149,8 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
     } = {};
     try {
       const pubRes = await fetch('/api/public/site-data', { cache: 'no-store' });
-      if (pubRes.ok) {
+      const pubType = pubRes.headers.get('content-type') || '';
+      if (pubRes.ok && pubType.includes('application/json')) {
         serverPublic = (await pubRes.json()) as typeof serverPublic;
       }
     } catch {
@@ -374,12 +375,13 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
             // Ignore network error
           }
         } else {
-          const [profRes, allTxRes, bonusRes, allRefRes, allTicketsRes, logsRes] = await Promise.all([
+          const [profRes, allTxRes, allProdRes, bonusRes, allRefRes, allTicketsRes, logsRes] = await Promise.all([
             supabase.from('profiles').select('*').order('created_at', { ascending: false }),
             supabase
               .from('demo_transactions')
               .select('*, profiles:profiles!demo_transactions_user_id_fkey(full_name, scania_id, email)')
               .order('created_at', { ascending: false }),
+            supabase.from('demo_user_products').select('*').order('started_at', { ascending: false }),
             supabase.from('bonus_codes').select('*').order('created_at', { ascending: false }),
             supabase
               .from('referral_records')
@@ -396,6 +398,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
 
           if (profRes.data) setAllProfiles(profRes.data as Profile[]);
           if (allTxRes.data) setAllTransactions(allTxRes.data as unknown as DemoTransaction[]);
+          if (allProdRes.data) setAllUserProducts(allProdRes.data as DemoUserProduct[]);
           if (bonusRes.data) setAllBonusCodes(bonusRes.data as BonusCode[]);
           if (allRefRes.data) setAllReferrals(allRefRes.data as unknown as ReferralRecord[]);
           if (allTicketsRes.data) setAllTickets(allTicketsRes.data as unknown as SupportTicket[]);

@@ -150,7 +150,39 @@ export const UsersView: React.FC = () => {
         'POST',
         { mode: balanceMode, amount: amt, note: balanceNote.trim() },
         async () => {
-          throw new Error('Server API required for balance adjustment.');
+          const currentBal = Number(balanceTarget.demo_balance || 0);
+          const nextBal =
+            balanceMode === 'add' ? Number((currentBal + amt).toFixed(2)) : Number((currentBal - amt).toFixed(2));
+          if (nextBal < 0) {
+            throw new Error('ব্যবহারকারীর ব্যালেন্স পর্যাপ্ত নয়।');
+          }
+          const { error: profErr } = await supabase!
+            .from('profiles')
+            .update({ demo_balance: nextBal, updated_at: new Date().toISOString() })
+            .eq('id', balanceTarget.id);
+          if (profErr) throw new Error(profErr.message);
+
+          await supabase!.from('demo_transactions').insert({
+            user_id: balanceTarget.id,
+            type: balanceMode === 'add' ? 'bonus_code' : 'withdraw_demo',
+            amount: amt,
+            method: balanceMode === 'add' ? 'Admin Add Balance' : 'Admin Deduct Balance',
+            reference_code: 'ADMIN-ADJ',
+            status: 'completed',
+            admin_note:
+              balanceNote.trim() || (balanceMode === 'add' ? 'অ্যাডমিন কর্তৃক ব্যালেন্স যোগ' : 'অ্যাডমিন কর্তৃক ব্যালেন্স কর্তন'),
+          });
+
+          await supabase!.from('notifications').insert({
+            user_id: balanceTarget.id,
+            title: balanceMode === 'add' ? 'ব্যালেন্স যোগ হয়েছে' : 'ব্যালেন্স সমন্বয় হয়েছে',
+            message:
+              balanceMode === 'add'
+                ? `আপনার অ্যাকাউন্টে ${amt} টাকা যোগ করা হয়েছে।`
+                : `আপনার অ্যাকাউন্ট থেকে ${amt} টাকা কেটে নেওয়া হয়েছে।`,
+            category: 'transaction',
+          });
+          return { ok: true };
         }
       );
       await refreshAll();
@@ -220,7 +252,45 @@ export const UsersView: React.FC = () => {
         'POST',
         { planId: selectedPlanId, tier: selectedTier.trim() },
         async () => {
-          throw new Error('Server API required for VIP plan assignment.');
+          const plan = plans.find((p) => p.id === selectedPlanId);
+          if (!plan) throw new Error('নির্বাচিত প্ল্যানটি পাওয়া যায়নি।');
+          const expiresAt = new Date(Date.now() + Number(plan.validity_days) * 86400000).toISOString();
+          const { error: prodErr } = await supabase!.from('demo_user_products').insert({
+            user_id: vipTarget.id,
+            plan_id: plan.id,
+            plan_title: plan.title,
+            demo_price: plan.demo_price,
+            daily_income: plan.daily_income,
+            validity_days: plan.validity_days,
+            status: 'active',
+            expires_at: expiresAt,
+          });
+          if (prodErr) throw new Error(prodErr.message);
+
+          if (selectedTier.trim()) {
+            await supabase!
+              .from('profiles')
+              .update({ tier: selectedTier.trim(), updated_at: new Date().toISOString() })
+              .eq('id', vipTarget.id);
+          }
+
+          await supabase!.from('demo_transactions').insert({
+            user_id: vipTarget.id,
+            type: 'plan_purchase',
+            amount: plan.demo_price,
+            method: 'Admin VIP Assign',
+            reference_code: plan.title,
+            status: 'completed',
+            admin_note: `অ্যাডমিন থেকে ${plan.title} VIP প্যাকেজ যুক্ত হয়েছে`,
+          });
+
+          await supabase!.from('notifications').insert({
+            user_id: vipTarget.id,
+            title: 'অ্যাডমিন থেকে নতুন VIP প্ল্যান যুক্ত হয়েছে',
+            message: `আপনার অ্যাকাউন্টে "${plan.title}" প্ল্যানটি সফলভাবে যুক্ত করা হয়েছে।`,
+            category: 'system',
+          });
+          return { ok: true };
         }
       );
       await refreshAll();

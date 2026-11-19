@@ -157,6 +157,8 @@ create table if not exists public.site_settings (
   support_email text not null default 'support@scania-demo.example',
   support_phone text not null default '+880 1700-000000',
   telegram_link text not null default 'https://t.me/scania_demo_community',
+  deposit_bkash_number text not null default '01995616092',
+  deposit_nagad_number text not null default '01995616092',
   theme_accent text not null default '#1250C4',
   show_team_tab boolean not null default true,
   show_bonus_button boolean not null default true,
@@ -164,6 +166,9 @@ create table if not exists public.site_settings (
   about_text text not null default 'Scania Investment Platform is a simulated fleet investment demonstration environment showcasing mobile-first portfolio tracking, multi-level referral modeling, and real-time administration.',
   updated_at timestamptz not null default now()
 );
+
+alter table public.site_settings add column if not exists deposit_bkash_number text not null default '01995616092';
+alter table public.site_settings add column if not exists deposit_nagad_number text not null default '01995616092';
 
 -- 2.12 Support Tickets
 create table if not exists public.support_tickets (

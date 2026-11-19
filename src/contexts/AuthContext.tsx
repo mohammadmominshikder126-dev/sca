@@ -331,7 +331,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           body: JSON.stringify({ phoneOrEmail: trimmed, password }),
         });
 
-        if (srvRes.ok) {
+        const srvType = srvRes.headers.get('content-type') || '';
+        if (srvRes.ok && srvType.includes('application/json')) {
           const srvData = (await srvRes.json()) as {
             mode?: string;
             token?: string;
@@ -342,7 +343,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setJustLoggedIn(true);
             return {};
           }
-        } else if (srvRes.status === 401 || srvRes.status === 403 || srvRes.status === 400) {
+        } else if (
+          (srvRes.status === 401 || srvRes.status === 403 || srvRes.status === 400) &&
+          srvType.includes('application/json')
+        ) {
           const errBody = (await srvRes.json().catch(() => ({}))) as { error?: string };
           return { error: errBody.error || 'Invalid phone number or password.' };
         }
@@ -367,7 +371,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ phoneOrEmail: trimmed }),
         });
-        if (prepRes.ok) {
+        const prepType = prepRes.headers.get('content-type') || '';
+        if (prepRes.ok && prepType.includes('application/json')) {
           const prepData = (await prepRes.json()) as { email?: string };
           if (prepData.email) {
             email = prepData.email;
@@ -439,42 +444,94 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }),
       });
 
-      const regBody = (await regRes.json().catch(() => ({}))) as {
-        ok?: boolean;
-        mode?: 'supabase' | 'server';
-        email?: string;
-        token?: string;
-        profile?: Profile;
-        error?: string;
-      };
+      const contentType = regRes.headers.get('content-type') || '';
+      const isStaticOrMissingApi = regRes.status === 404 || regRes.status === 405 || !contentType.includes('application/json');
 
-      if (!regRes.ok) {
-        return { error: regBody.error || 'Registration failed. Please try again.' };
-      }
+      if (!isStaticOrMissingApi) {
+        const regBody = (await regRes.json().catch(() => ({}))) as {
+          ok?: boolean;
+          mode?: 'supabase' | 'server';
+          email?: string;
+          token?: string;
+          profile?: Profile;
+          error?: string;
+        };
 
-      if (regBody.mode === 'server' && regBody.profile) {
-        applyServerAuthSession(regBody.profile, regBody.token);
+        if (!regRes.ok) {
+          return { error: regBody.error || 'Registration failed. Please try again.' };
+        }
+
+        if (regBody.mode === 'server' && regBody.profile) {
+          applyServerAuthSession(regBody.profile, regBody.token);
+          setJustLoggedIn(true);
+          return {};
+        }
+
+        if (supabase) {
+          const loginEmail = regBody.email || toAuthEmail(cleanPhone).email;
+          const { data: loginData, error: loginErr } = await supabase.auth.signInWithPassword({
+            email: loginEmail,
+            password,
+          });
+          if (loginErr) return { error: loginErr.message };
+          if (loginData.user) {
+            await loadUserDetails(loginData.user.id);
+          }
+        }
+
         setJustLoggedIn(true);
         return {};
       }
+    } catch {
+      // Fall through to direct Supabase registration when server API is unavailable
+    }
 
-      if (supabase) {
-        const loginEmail = regBody.email || toAuthEmail(cleanPhone).email;
-        const { data: loginData, error: loginErr } = await supabase.auth.signInWithPassword({
+    if (supabase) {
+      let loginEmail = toAuthEmail(cleanPhone).email;
+      const { data: rpcData, error: rpcErr } = await supabase.rpc('register_phone_user', {
+        p_phone: cleanPhone,
+        p_password: password,
+        p_referral_code: referralCode?.trim() || '',
+      });
+
+      if (!rpcErr && rpcData && typeof rpcData === 'object' && 'email' in rpcData && rpcData.email) {
+        loginEmail = String(rpcData.email);
+      } else if (rpcErr) {
+        const msg = rpcErr.message.toLowerCase();
+        if (msg.includes('already registered') || msg.includes('valid phone') || msg.includes('password')) {
+          return { error: rpcErr.message };
+        }
+        const { error: signUpErr } = await supabase.auth.signUp({
           email: loginEmail,
           password,
+          options: {
+            data: {
+              phone: cleanPhone,
+              full_name: fullName?.trim() || `Member ${digits.slice(-4)}`,
+              referral_code: referralCode?.trim().toUpperCase() || '',
+            },
+          },
         });
-        if (loginErr) return { error: loginErr.message };
-        if (loginData.user) {
-          await loadUserDetails(loginData.user.id);
+        if (signUpErr) {
+          return { error: signUpErr.message };
         }
       }
 
+      const { data: loginData, error: loginErr } = await supabase.auth.signInWithPassword({
+        email: loginEmail,
+        password,
+      });
+      if (loginErr) {
+        return { error: loginErr.message };
+      }
+      if (loginData.user) {
+        await loadUserDetails(loginData.user.id);
+      }
       setJustLoggedIn(true);
       return {};
-    } catch {
-      return { error: 'Unable to reach registration service. Please try again.' };
     }
+
+    return { error: 'Unable to reach registration service. Please try again.' };
   };
 
   const adminSignIn = async (email: string, password: string) => {
