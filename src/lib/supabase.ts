@@ -3,10 +3,19 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
 const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
+function isValidSupabaseUrl(value: string): boolean {
+  if (!value || value.includes('your-project-id')) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 export const isSupabaseConfigured = Boolean(
-  supabaseUrl &&
+  isValidSupabaseUrl(supabaseUrl) &&
     supabaseAnonKey &&
-    !supabaseUrl.includes('your-project-id') &&
     !supabaseAnonKey.includes('your-supabase-anon-key')
 );
 
@@ -65,16 +74,62 @@ export function formatRelativeTime(iso: string): string {
   return `${days}d ago`;
 }
 
+export const SERVER_TOKEN_STORAGE_KEY = 'scania_server_token';
+export const ADMIN_TOKEN_STORAGE_KEY = 'scania_admin_token';
+export const SIGNED_OUT_FLAG_KEY = 'scania_signed_out';
+
+export function getStoredServerToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return (
+    window.sessionStorage.getItem(SERVER_TOKEN_STORAGE_KEY) ||
+    window.localStorage.getItem(SERVER_TOKEN_STORAGE_KEY)
+  );
+}
+
+export function setStoredServerToken(token: string | null) {
+  if (typeof window === 'undefined') return;
+  if (token) {
+    window.sessionStorage.setItem(SERVER_TOKEN_STORAGE_KEY, token);
+    window.localStorage.setItem(SERVER_TOKEN_STORAGE_KEY, token);
+    window.localStorage.removeItem(SIGNED_OUT_FLAG_KEY);
+  } else {
+    window.sessionStorage.removeItem(SERVER_TOKEN_STORAGE_KEY);
+    window.localStorage.removeItem(SERVER_TOKEN_STORAGE_KEY);
+  }
+}
+
+export function getStoredAdminToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return (
+    window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY) ||
+    window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)
+  );
+}
+
+export function setStoredAdminToken(token: string | null) {
+  if (typeof window === 'undefined') return;
+  if (token) {
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+    window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+  } else {
+    window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+    window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  }
+}
+
+export function clearStoredTokens() {
+  setStoredServerToken(null);
+  setStoredAdminToken(null);
+}
+
 export async function callApiWithFallback<T>(
   endpoint: string,
   method: 'POST' | 'PUT' | 'DELETE',
   body: Record<string, unknown>,
   fallbackFn?: () => Promise<T>
 ): Promise<T> {
-  const adminToken =
-    typeof window !== 'undefined' ? window.sessionStorage.getItem('scania_admin_token') : null;
-  const serverToken =
-    typeof window !== 'undefined' ? window.sessionStorage.getItem('scania_server_token') : null;
+  const adminToken = getStoredAdminToken();
+  const serverToken = getStoredServerToken();
   let token =
     endpoint.startsWith('/api/admin') && adminToken
       ? adminToken

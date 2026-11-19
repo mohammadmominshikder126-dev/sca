@@ -11,10 +11,23 @@ import { createClient, SupabaseClient, User } from '@supabase/supabase-js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT || 3000);
-const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
-const SUPABASE_ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const PORT =
+  process.env.NODE_ENV === 'production' && !process.env.NGINX_PORT
+    ? Number(process.env.PORT || 3000)
+    : Number(process.env.DEFAULT_APP_PORT || 3000);
+const SUPABASE_URL = (process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
+const SUPABASE_ANON_KEY = (process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
+const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+
+function isValidHttpUrl(value: string): boolean {
+  if (!value || value.includes('your-project-id')) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
 
 function isValidServiceRoleKey(key: string): boolean {
   if (!key) return false;
@@ -33,20 +46,28 @@ function isValidServiceRoleKey(key: string): boolean {
   return false;
 }
 
-const isSupabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
-const isAdminClientReady = Boolean(SUPABASE_URL && isValidServiceRoleKey(SUPABASE_SERVICE_ROLE_KEY));
-
-const supabaseAdmin: SupabaseClient | null = isAdminClientReady
-  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+function createSafeSupabaseClient(url: string, key: string): SupabaseClient | null {
+  if (!isValidHttpUrl(url) || !key) return null;
+  try {
+    return createClient(url, key, {
       auth: { autoRefreshToken: false, persistSession: false },
-    })
+    });
+  } catch {
+    return null;
+  }
+}
+
+const supabaseAdmin: SupabaseClient | null = isValidServiceRoleKey(SUPABASE_SERVICE_ROLE_KEY)
+  ? createSafeSupabaseClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
   : null;
 
-const supabasePublic: SupabaseClient | null = isSupabaseConfigured
-  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-      auth: { autoRefreshToken: false, persistSession: false },
-    })
-  : null;
+const supabasePublic: SupabaseClient | null =
+  SUPABASE_ANON_KEY && !SUPABASE_ANON_KEY.includes('your-supabase-anon-key')
+    ? createSafeSupabaseClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+
+const isSupabaseConfigured = Boolean(supabasePublic);
+const isAdminClientReady = Boolean(supabaseAdmin);
 
 interface AuthedRequest extends Request {
   authUser?: User;

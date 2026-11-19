@@ -4,7 +4,14 @@ import { ArrowRight, Box, Calendar, CheckCircle2, Crown, Gift, TrendingUp, X } f
 import { PlanFallbackThumbnail } from '../../components/ScaniaVisuals';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { callApiWithFallback, formatCurrency, formatDateTime, formatShortDate, supabase } from '../../lib/supabase';
+import {
+  callApiWithFallback,
+  formatCurrency,
+  formatDateTime,
+  formatShortDate,
+  getStoredServerToken,
+  supabase,
+} from '../../lib/supabase';
 import { DemoPlan } from '../../types/database';
 import { ConfirmModal, EmptyState, useToast } from '../../components/ui/Feedback';
 
@@ -44,8 +51,7 @@ export const MyProductTab: React.FC = () => {
 
   const handleConfirmPurchase = async () => {
     if (!confirmPlan) return;
-    const hasSessionToken =
-      typeof window !== 'undefined' && Boolean(window.sessionStorage.getItem('scania_server_token'));
+    const hasSessionToken = Boolean(getStoredServerToken());
 
     if ((isPreviewMode && !hasSessionToken) || !user) {
       showToast('প্ল্যান কেনার জন্য প্রথমে লগইন করুন', 'warning');

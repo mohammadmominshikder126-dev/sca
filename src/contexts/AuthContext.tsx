@@ -1,6 +1,21 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { Session, User } from '@supabase/supabase-js';
-import { isSupabaseConfigured, supabase } from '../lib/supabase';
+import {
+  clearStoredTokens,
+  getStoredAdminToken,
+  getStoredServerToken,
+  isSupabaseConfigured,
+  setStoredAdminToken,
+  setStoredServerToken,
+  SIGNED_OUT_FLAG_KEY,
+  supabase,
+} from '../lib/supabase';
+import {
+  localGetMemberByToken,
+  localLoginMember,
+  localRegisterMember,
+  localSaveCachedProfile,
+} from '../lib/localFallbackStore';
 import { AppRole, Profile } from '../types/database';
 import { PREVIEW_USER_PROFILE } from '../data/previewFallback';
 
@@ -85,16 +100,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setRole((roleRow?.role as AppRole) || 'user');
   }, []);
 
-  const SERVER_TOKEN_KEY = 'scania_server_token';
-  const ADMIN_TOKEN_KEY = 'scania_admin_token';
-
   const applyServerAuthSession = useCallback((srvProfile: Profile, token?: string, nextRole: AppRole = 'user') => {
     if (token && typeof window !== 'undefined') {
       if (nextRole === 'admin' || nextRole === 'super_admin') {
-        window.sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
+        setStoredAdminToken(token);
       } else {
-        window.sessionStorage.setItem(SERVER_TOKEN_KEY, token);
+        setStoredServerToken(token);
       }
+    }
+    if (nextRole === 'user') {
+      localSaveCachedProfile(srvProfile);
     }
     setProfile(srvProfile);
     setUser({
@@ -114,8 +129,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return;
     }
     if (typeof window !== 'undefined') {
-      const token = window.sessionStorage.getItem(SERVER_TOKEN_KEY);
+      const token = getStoredServerToken();
       if (token) {
+        if (token.startsWith('local:')) {
+          const localProf = localGetMemberByToken(token);
+          if (localProf) applyServerAuthSession(localProf);
+          return;
+        }
         try {
           const res = await fetch('/api/auth/me', {
             headers: { Authorization: `Bearer ${token}` },
@@ -134,7 +154,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) {
       if (typeof window !== 'undefined') {
-        const adminToken = window.sessionStorage.getItem(ADMIN_TOKEN_KEY);
+        const adminToken = getStoredAdminToken();
         if (adminToken && window.location.pathname.startsWith('/admin')) {
           applyServerAuthSession(
             {
@@ -159,16 +179,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setLoading(false);
           return;
         }
-        const serverToken = window.sessionStorage.getItem(SERVER_TOKEN_KEY);
+        const serverToken = getStoredServerToken();
         if (serverToken) {
+          if (serverToken.startsWith('local:')) {
+            const localProf = localGetMemberByToken(serverToken);
+            if (localProf) {
+              applyServerAuthSession(localProf);
+              setLoading(false);
+              return;
+            }
+          }
           fetch('/api/auth/me', { headers: { Authorization: `Bearer ${serverToken}` } })
             .then((r) => (r.ok ? r.json() : null))
             .then((srvData: { profile?: Profile } | null) => {
               if (srvData?.profile) {
                 applyServerAuthSession(srvData.profile);
               } else {
-                setProfile({ ...PREVIEW_USER_PROFILE, full_name: 'Naymhasam', tier: 'Diamond' });
-                setRole('user');
+                const cached = localGetMemberByToken(`local:${serverToken}`) || null;
+                if (cached) {
+                  applyServerAuthSession(cached);
+                } else {
+                  setProfile({ ...PREVIEW_USER_PROFILE, full_name: 'Naymhasam', tier: 'Diamond' });
+                  setRole('user');
+                }
               }
               setLoading(false);
             })
@@ -180,12 +213,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           return;
         }
       }
-      setProfile({
-        ...PREVIEW_USER_PROFILE,
-        full_name: 'Naymhasam',
-        tier: 'Diamond',
-      });
-      setRole('user');
+      const signedOut =
+        typeof window !== 'undefined' && window.localStorage.getItem(SIGNED_OUT_FLAG_KEY) === '1';
+      if (!signedOut) {
+        setProfile({
+          ...PREVIEW_USER_PROFILE,
+          full_name: 'Naymhasam',
+          tier: 'Diamond',
+        });
+        setRole('user');
+      }
       setLoading(false);
       return;
     }
@@ -205,7 +242,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       // Restore server-issued admin or member session if present
       if (typeof window !== 'undefined') {
-        const adminToken = window.sessionStorage.getItem(ADMIN_TOKEN_KEY);
+        const adminToken = getStoredAdminToken();
         if (adminToken && window.location.pathname.startsWith('/admin')) {
           try {
             const adminRes = await fetch('/api/admin/state', {
@@ -235,14 +272,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               setLoading(false);
               return;
             } else {
-              window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+              setStoredAdminToken(null);
             }
           } catch {
             // Ignore network error
           }
         }
 
-        const token = window.sessionStorage.getItem(SERVER_TOKEN_KEY);
+        const token = getStoredServerToken();
         if (token) {
           try {
             const res = await fetch('/api/auth/me', {
@@ -256,7 +293,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 return;
               }
             } else {
-              window.sessionStorage.removeItem(SERVER_TOKEN_KEY);
+              setStoredServerToken(null);
             }
           } catch {
             // Ignore network error
@@ -272,9 +309,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const { data: sub } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
       if (!mounted) return;
       if (newSession?.user) {
-        if (typeof window !== 'undefined') {
-          window.sessionStorage.removeItem(SERVER_TOKEN_KEY);
-        }
+        setStoredServerToken(null);
         setSession(newSession);
         setUser(newSession.user);
         await loadUserDetails(newSession.user.id);
@@ -282,8 +317,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setSession(null);
         const hasServerToken =
           typeof window !== 'undefined' &&
-          (Boolean(window.sessionStorage.getItem(SERVER_TOKEN_KEY)) ||
-            Boolean(window.sessionStorage.getItem(ADMIN_TOKEN_KEY)));
+          (Boolean(getStoredServerToken()) || Boolean(getStoredAdminToken()));
         if (!hasServerToken) {
           setUser(null);
           setProfile(null);
@@ -356,8 +390,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     if (!supabase) {
-      setJustLoggedIn(true);
-      return {};
+      const localRes = localLoginMember(trimmed, password);
+      if (localRes?.error) {
+        return { error: localRes.error };
+      }
+      if (localRes?.profile && localRes.token) {
+        applyServerAuthSession(localRes.profile, localRes.token);
+        setJustLoggedIn(true);
+        return {};
+      }
+      return { error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' };
     }
 
     let { email } = toAuthEmail(trimmed);
@@ -462,6 +504,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
 
         if (regBody.mode === 'server' && regBody.profile) {
+          localSaveCachedProfile(regBody.profile, password);
           applyServerAuthSession(regBody.profile, regBody.token);
           setJustLoggedIn(true);
           return {};
@@ -531,7 +574,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return {};
     }
 
-    return { error: 'Unable to reach registration service. Please try again.' };
+    // Local browser fallback when running without Supabase or Node backend
+    const localReg = localRegisterMember({
+      phone: cleanPhone,
+      password,
+      fullName: fullName?.trim(),
+      referralCode: referralCode?.trim(),
+    });
+    if (localReg.error) {
+      return { error: localReg.error };
+    }
+    if (localReg.profile && localReg.token) {
+      applyServerAuthSession(localReg.profile, localReg.token);
+      setJustLoggedIn(true);
+      return {};
+    }
+
+    return { error: 'রেজিস্ট্রেশন সম্পন্ন করা যায়নি। আবার চেষ্টা করুন।' };
   };
 
   const adminSignIn = async (email: string, password: string) => {
@@ -581,9 +640,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const signOut = async () => {
+    clearStoredTokens();
     if (typeof window !== 'undefined') {
-      window.sessionStorage.removeItem(SERVER_TOKEN_KEY);
-      window.sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+      window.localStorage.setItem(SIGNED_OUT_FLAG_KEY, '1');
     }
     if (supabase) {
       await supabase.auth.signOut();
@@ -596,9 +655,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const updatePassword = async (newPassword: string) => {
-    const serverToken =
-      typeof window !== 'undefined' ? window.sessionStorage.getItem(SERVER_TOKEN_KEY) : null;
-    if (serverToken) {
+    const serverToken = getStoredServerToken();
+    if (serverToken && !serverToken.startsWith('local:')) {
       try {
         const res = await fetch('/api/user/change-password', {
           method: 'POST',

@@ -16,7 +16,13 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { callApiWithFallback, formatCurrency, formatDateTime, supabase } from '../../lib/supabase';
+import {
+  callApiWithFallback,
+  formatCurrency,
+  formatDateTime,
+  getStoredServerToken,
+  supabase,
+} from '../../lib/supabase';
 import { EmptyState, useToast } from '../../components/ui/Feedback';
 import { SupportTicket } from '../../types/database';
 import { TransactionHistoryContent } from './TransactionHistoryPage';
@@ -88,8 +94,7 @@ export const UserActionModals: React.FC<{
 
   if (!activeModal) return null;
 
-  const hasSessionToken =
-    typeof window !== 'undefined' && Boolean(window.sessionStorage.getItem('scania_server_token'));
+  const hasSessionToken = Boolean(getStoredServerToken());
 
   const ensureLive = () => {
     if ((isPreviewMode && !hasSessionToken) || !user) {

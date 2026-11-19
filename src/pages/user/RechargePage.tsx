@@ -113,6 +113,10 @@ export const RechargePage: React.FC = () => {
           <div className="grid grid-cols-3 gap-2.5">
             {quickAmounts.map((val) => {
               const selected = parsedAmount === val;
+              const selectedStyle =
+                channel === 'bKash'
+                  ? 'bg-[#FDF0F5] border-[#E2136E] text-[#C80F5E]'
+                  : 'bg-[#FFF2EA] border-[#EC461A] text-[#D93814]';
               return (
                 <button
                   key={val}
@@ -120,8 +124,8 @@ export const RechargePage: React.FC = () => {
                   onClick={() => setAmountInput(String(val))}
                   className={`py-3 px-2 rounded-xl text-sm font-bold tabular-nums transition-all border shadow-2xs ${
                     selected
-                      ? 'bg-[#EEF4FF] border-[#2563EB] text-[#1D4ED8]'
-                      : 'bg-white border-slate-100 text-slate-900 hover:border-blue-200'
+                      ? selectedStyle
+                      : 'bg-white border-slate-100 text-slate-900 hover:border-slate-300'
                   }`}
                 >
                   {siteSettings.currency_symbol}
@@ -137,54 +141,58 @@ export const RechargePage: React.FC = () => {
           <h2 className="text-lg font-extrabold text-slate-900">পেমেন্ট মাধ্যম</h2>
 
           <div className="grid grid-cols-2 gap-3">
-            {/* bKash Option */}
+            {/* bKash Option (Logo Pink Theme #E2136E) */}
             <button
               type="button"
               onClick={() => setChannel('bKash')}
-              className={`bg-white rounded-2xl px-3.5 py-3.5 flex items-center justify-between gap-2 transition-all border-2 ${
+              className={`rounded-2xl px-3.5 py-3.5 flex items-center justify-between gap-2 transition-all border-2 ${
                 channel === 'bKash'
-                  ? 'border-[#2563EB] shadow-sm'
-                  : 'border-slate-100 hover:border-slate-200'
+                  ? 'bg-[#FDF0F5] border-[#E2136E] shadow-sm'
+                  : 'bg-white border-slate-100 hover:border-pink-200'
               }`}
             >
               <div className="flex items-center gap-2.5 min-w-0">
                 <img
                   src="/assets/aistudio/8ce1d5fe9f0ec0eba7f121e646ca7720_5b38b9ee.png"
                   alt="bKash"
-                  className="w-10 h-10 rounded-full object-cover shrink-0 border border-pink-100 bg-white"
+                  className="w-10 h-10 rounded-full object-cover shrink-0 border border-pink-200 bg-white"
                 />
-                <span className="text-sm font-bold text-slate-900 truncate">bKash</span>
+                <span className={`text-sm font-bold truncate ${channel === 'bKash' ? 'text-[#C80F5E]' : 'text-slate-900'}`}>
+                  bKash
+                </span>
               </div>
               <span
                 className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 ${
-                  channel === 'bKash' ? 'border-[#2563EB] bg-[#2563EB]' : 'border-slate-300 bg-white'
+                  channel === 'bKash' ? 'border-[#E2136E] bg-[#E2136E]' : 'border-slate-300 bg-white'
                 }`}
               >
                 {channel === 'bKash' && <span className="w-2 h-2 rounded-full bg-white" />}
               </span>
             </button>
 
-            {/* Nagad Option */}
+            {/* Nagad Option (Logo Orange-Red Theme #EC461A) */}
             <button
               type="button"
               onClick={() => setChannel('Nagad')}
-              className={`bg-white rounded-2xl px-3.5 py-3.5 flex items-center justify-between gap-2 transition-all border-2 ${
+              className={`rounded-2xl px-3.5 py-3.5 flex items-center justify-between gap-2 transition-all border-2 ${
                 channel === 'Nagad'
-                  ? 'border-[#2563EB] shadow-sm'
-                  : 'border-slate-100 hover:border-slate-200'
+                  ? 'bg-[#FFF2EA] border-[#EC461A] shadow-sm'
+                  : 'bg-white border-slate-100 hover:border-orange-200'
               }`}
             >
               <div className="flex items-center gap-2.5 min-w-0">
                 <img
                   src="/assets/aistudio/images__1___11__2dbd9c22.jpeg"
                   alt="Nagad"
-                  className="w-10 h-10 rounded-full object-cover shrink-0 border border-orange-100 bg-white"
+                  className="w-10 h-10 rounded-full object-cover shrink-0 border border-orange-200 bg-white"
                 />
-                <span className="text-sm font-bold text-slate-900 truncate">Nagad</span>
+                <span className={`text-sm font-bold truncate ${channel === 'Nagad' ? 'text-[#D93814]' : 'text-slate-900'}`}>
+                  Nagad
+                </span>
               </div>
               <span
                 className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 ${
-                  channel === 'Nagad' ? 'border-[#2563EB] bg-[#2563EB]' : 'border-slate-300 bg-white'
+                  channel === 'Nagad' ? 'border-[#EC461A] bg-[#EC461A]' : 'border-slate-300 bg-white'
                 }`}
               >
                 {channel === 'Nagad' && <span className="w-2 h-2 rounded-full bg-white" />}
@@ -192,7 +200,9 @@ export const RechargePage: React.FC = () => {
             </button>
           </div>
 
-          <p className="text-xs text-slate-600">{channel} পেজে পেমেন্ট নিশ্চিত করবেন।</p>
+          <p className={`text-xs font-semibold ${channel === 'bKash' ? 'text-[#C80F5E]' : 'text-[#D93814]'}`}>
+            {channel} পেজে পেমেন্ট নিশ্চিত করবেন।
+          </p>
         </section>
 
         {/* Pending Deposit Strip (পেমেন্টের অপেক্ষা) */}
@@ -226,9 +236,13 @@ export const RechargePage: React.FC = () => {
             type="button"
             onClick={handleProceed}
             className={`w-full py-3.5 rounded-2xl text-white font-bold text-base transition-all shadow-sm ${
-              isAmountValid
-                ? 'bg-[#2563EB] hover:bg-[#1D4ED8]'
-                : 'bg-[#94B8F7] hover:bg-[#7CA7F5]'
+              channel === 'bKash'
+                ? isAmountValid
+                  ? 'bg-[#E2136E] hover:bg-[#C80F5E]'
+                  : 'bg-[#E2136E]/60 hover:bg-[#E2136E]/75'
+                : isAmountValid
+                ? 'bg-[#EC461A] hover:bg-[#D93814]'
+                : 'bg-[#EC461A]/60 hover:bg-[#EC461A]/75'
             }`}
           >
             এখনই রিচার্জ

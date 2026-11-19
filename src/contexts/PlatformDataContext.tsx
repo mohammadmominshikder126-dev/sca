@@ -1,5 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { isSupabaseConfigured, supabase } from '../lib/supabase';
+import { getStoredAdminToken, getStoredServerToken, isSupabaseConfigured, supabase } from '../lib/supabase';
+import { getPreviewDeposits } from '../lib/localFallbackStore';
 import {
   AdminAuditLog,
   Announcement,
@@ -157,10 +158,8 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
       // Ignore if static host
     }
 
-    const serverToken =
-      typeof window !== 'undefined' ? window.sessionStorage.getItem('scania_server_token') : null;
-    const adminToken =
-      typeof window !== 'undefined' ? window.sessionStorage.getItem('scania_admin_token') : null;
+    const serverToken = getStoredServerToken();
+    const adminToken = getStoredAdminToken();
 
     if (!isSupabaseConfigured || !supabase) {
       setSiteSettings(serverPublic.siteSettings || PREVIEW_SITE_SETTINGS);
@@ -174,7 +173,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         serverPublic.banners && serverPublic.banners.length > 0 ? serverPublic.banners : PREVIEW_BANNERS
       );
 
-      if (serverToken) {
+      if (serverToken && !serverToken.startsWith('local:')) {
         const srvState = await fetchServerUserState(serverToken);
         if (srvState) {
           setBankCard(srvState.bankCard || null);
@@ -188,8 +187,9 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
           );
         }
       } else {
+        const previewTxs = getPreviewDeposits();
         setNotifications(PREVIEW_NOTIFICATIONS);
-        setUserTransactions(PREVIEW_TRANSACTIONS);
+        setUserTransactions(previewTxs.length > 0 ? previewTxs : PREVIEW_TRANSACTIONS);
         setUserProducts(PREVIEW_USER_PRODUCTS);
         setUserReferrals(PREVIEW_REFERRALS);
       }
@@ -338,8 +338,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
       }
 
       if (isAdmin) {
-        const adminToken =
-          typeof window !== 'undefined' ? window.sessionStorage.getItem('scania_admin_token') : null;
+        const adminToken = getStoredAdminToken();
 
         if (adminToken) {
           try {
@@ -500,10 +499,9 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
       const target = notifications.find((n) => n.id === notificationId);
       if (!target) return;
 
-      const serverToken =
-        typeof window !== 'undefined' ? window.sessionStorage.getItem('scania_server_token') : null;
+      const serverToken = getStoredServerToken();
 
-      if (serverToken) {
+      if (serverToken && !serverToken.startsWith('local:')) {
         await fetch('/api/user/notification-read', {
           method: 'POST',
           headers: {
