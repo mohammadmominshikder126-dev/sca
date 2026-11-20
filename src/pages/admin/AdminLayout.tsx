@@ -47,49 +47,47 @@ export const AdminLayout: React.FC = () => {
     [allTickets]
   );
 
-  // Strict RBAC gate when Supabase is configured
-  if (!isPreviewMode) {
-    if (loading) {
-      return (
-        <div className="min-h-screen bg-[#041233] text-white flex items-center justify-center">
-          <div className="text-center space-y-2">
-            <ScaniaLogoEmblem className="w-12 h-12 mx-auto animate-pulse" />
-            <p className="text-sm text-blue-200">Verifying Administrator Session...</p>
-          </div>
+  // Strict RBAC gate — Admin Panel always requires authenticated administrator session
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-[#041233] text-white flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <ScaniaLogoEmblem className="w-12 h-12 mx-auto animate-pulse" />
+          <p className="text-sm text-blue-200">Verifying Administrator Session...</p>
         </div>
-      );
-    }
+      </div>
+    );
+  }
 
-    if (!user || !isAdmin) {
-      return (
-        <div className="min-h-screen bg-[#041233] text-white flex items-center justify-center p-4">
-          <div className="max-w-md w-full bg-[#081D4D] border border-blue-500/25 rounded-3xl p-7 text-center shadow-2xl">
-            <div className="w-12 h-12 rounded-2xl bg-rose-500/20 text-rose-300 flex items-center justify-center mx-auto mb-3">
-              <ShieldAlert className="w-6 h-6" />
-            </div>
-            <h1 className="font-display text-xl font-bold">Admin Authorization Required</h1>
-            <p className="text-xs text-blue-200 mt-2 leading-relaxed">
-              This portal is restricted to verified administrators in <code className="font-mono">user_roles</code>.
-              Normal users cannot access admin routes or data.
-            </p>
-            <div className="mt-6 flex flex-col gap-2.5">
-              <Link
-                to="/admin/login"
-                className="w-full py-3 rounded-xl bg-[#1E6FFF] hover:bg-blue-500 text-white text-sm font-semibold"
-              >
-                Sign In as Admin
-              </Link>
-              <Link
-                to="/user"
-                className="w-full py-3 rounded-xl bg-white/10 hover:bg-white/15 text-blue-100 text-sm font-semibold"
-              >
-                Return to User Portal
-              </Link>
-            </div>
+  if (!user || !isAdmin) {
+    return (
+      <div className="min-h-screen bg-[#041233] text-white flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-[#081D4D] border border-blue-500/25 rounded-3xl p-7 text-center shadow-2xl">
+          <div className="w-12 h-12 rounded-2xl bg-rose-500/20 text-rose-300 flex items-center justify-center mx-auto mb-3">
+            <ShieldAlert className="w-6 h-6" />
+          </div>
+          <h1 className="font-display text-xl font-bold">Admin Authorization Required</h1>
+          <p className="text-xs text-blue-200 mt-2 leading-relaxed">
+            This portal is restricted to verified administrators in <code className="font-mono">user_roles</code>.
+            Normal users cannot access admin routes or data.
+          </p>
+          <div className="mt-6 flex flex-col gap-2.5">
+            <Link
+              to="/admin/login"
+              className="w-full py-3 rounded-xl bg-[#1E6FFF] hover:bg-blue-500 text-white text-sm font-semibold"
+            >
+              Sign In as Admin
+            </Link>
+            <Link
+              to="/login"
+              className="w-full py-3 rounded-xl bg-white/10 hover:bg-white/15 text-blue-100 text-sm font-semibold"
+            >
+              Return to User Login
+            </Link>
           </div>
         </div>
-      );
-    }
+      </div>
+    );
   }
 
   const navItems = [

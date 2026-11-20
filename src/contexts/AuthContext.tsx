@@ -18,7 +18,6 @@ import {
   localSaveCachedProfile,
 } from '../lib/localFallbackStore';
 import { AppRole, Profile } from '../types/database';
-import { PREVIEW_USER_PROFILE } from '../data/previewFallback';
 
 interface AuthContextValue {
   session: Session | null;
@@ -228,16 +227,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               return;
             }
           }
-        }
-        const signedOut =
-          typeof window !== 'undefined' && window.localStorage.getItem(SIGNED_OUT_FLAG_KEY) === '1';
-        if (!signedOut && typeof window !== 'undefined' && !window.location.pathname.startsWith('/admin')) {
-          setProfile({
-            ...PREVIEW_USER_PROFILE,
-            full_name: 'Naymhasam',
-            tier: 'Diamond',
-          });
-          setRole('user');
         }
         if (mounted) setLoading(false);
         return;

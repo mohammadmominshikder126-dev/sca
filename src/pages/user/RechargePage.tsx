@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Navigate, useNavigate } from 'react-router-dom';
 import { ChevronLeft, ChevronRight, History, Wallet } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
@@ -7,7 +7,7 @@ import { useToast } from '../../components/ui/Feedback';
 
 export const RechargePage: React.FC = () => {
   const navigate = useNavigate();
-  const { profile } = useAuth();
+  const { user, profile, loading } = useAuth();
   const { plans, siteSettings, userTransactions } = usePlatformData();
   const { showToast } = useToast();
 
@@ -46,6 +46,18 @@ export const RechargePage: React.FC = () => {
     }
     navigate(`/user/gateway?amount=${parsedAmount}&method=${encodeURIComponent(channel)}`);
   };
+
+  if (loading) {
+    return (
+      <div className="min-h-[100dvh] bg-[#F3F5FA] flex items-center justify-center text-sm font-semibold text-slate-600">
+        লোড হচ্ছে...
+      </div>
+    );
+  }
+
+  if (!user || !profile) {
+    return <Navigate to="/login" replace />;
+  }
 
   return (
     <div className="min-h-[100dvh] bg-[#F3F5FA] text-slate-900 flex flex-col">

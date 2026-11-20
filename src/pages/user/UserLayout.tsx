@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { Link, NavLink, Navigate, Outlet, useNavigate } from 'react-router-dom';
 import {
   Bell,
   Box,
@@ -24,7 +24,7 @@ export interface UserOutletContext {
 }
 
 export const UserLayout: React.FC = () => {
-  const { signOut, justLoggedIn, clearJustLoggedIn } = useAuth();
+  const { user, profile, loading, signOut, justLoggedIn, clearJustLoggedIn } = useAuth();
   const { siteSettings, notifications, readNotificationIds, markNotificationRead } = usePlatformData();
   const navigate = useNavigate();
 
@@ -36,6 +36,21 @@ export const UserLayout: React.FC = () => {
     () => notifications.filter((n) => !n.is_read && !readNotificationIds.includes(n.id)).length,
     [notifications, readNotificationIds]
   );
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-[#E9F1FC] flex items-center justify-center">
+        <div className="text-center space-y-2">
+          <ScaniaLogoEmblem className="w-12 h-12 mx-auto animate-pulse" />
+          <p className="text-sm font-semibold text-[#061844]">লোড হচ্ছে...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user || !profile) {
+    return <Navigate to="/login" replace />;
+  }
 
   const navItems = [
     { to: '/user', label: 'হোম', icon: Home, end: true },

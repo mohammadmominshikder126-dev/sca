@@ -1,12 +1,12 @@
 import React, { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Eye, EyeOff, Lock, Mail, ShieldCheck, AlertCircle, ArrowRight } from 'lucide-react';
+import { Eye, EyeOff, Lock, Mail, ShieldCheck, ArrowRight } from 'lucide-react';
 import { ScaniaLogoEmblem } from '../../components/ScaniaVisuals';
 import { useAuth } from '../../contexts/AuthContext';
 import { useToast } from '../../components/ui/Feedback';
 
 export const AdminLoginPage: React.FC = () => {
-  const { adminSignIn, isPreviewMode } = useAuth();
+  const { adminSignIn } = useAuth();
   const { showToast } = useToast();
   const navigate = useNavigate();
 
@@ -62,19 +62,6 @@ export const AdminLoginPage: React.FC = () => {
               <p className="text-xs text-blue-200/80">Role-verified gateway · Normal users are blocked</p>
             </div>
           </div>
-
-          {isPreviewMode && (
-            <div className="mt-4 p-3.5 rounded-xl bg-amber-500/15 border border-amber-400/30 text-xs text-amber-100 flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
-              <div>
-                Supabase is unconfigured. You can{' '}
-                <Link to="/admin" className="font-bold underline text-white">
-                  preview the Admin Dashboard UI
-                </Link>{' '}
-                or sign in with your configured server Admin credentials.
-              </div>
-            </div>
-          )}
 
           {errorMsg && (
             <div className="mt-4 p-3 rounded-xl bg-rose-500/15 border border-rose-400/40 text-xs text-rose-200 font-medium">

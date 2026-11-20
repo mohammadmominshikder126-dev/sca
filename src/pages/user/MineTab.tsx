@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { formatCurrency } from '../../lib/supabase';
+import { formatCurrency, getStoredServerToken } from '../../lib/supabase';
 import { ConfirmModal, useToast } from '../../components/ui/Feedback';
 import { UserOutletContext } from './UserLayout';
 
@@ -39,7 +39,7 @@ export const MineTab: React.FC = () => {
 
   const handlePasswordChange = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (isPreviewMode || !user) {
+    if (!user || (isPreviewMode && !getStoredServerToken())) {
       showToast('পাসওয়ার্ড পরিবর্তন করতে অনুগ্রহ করে লগইন করুন', 'warning');
       return;
     }

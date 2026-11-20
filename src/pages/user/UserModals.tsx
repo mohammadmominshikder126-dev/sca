@@ -183,17 +183,17 @@ export const UserActionModals: React.FC<{
               : referenceCode.trim() || `TRX-${Date.now().toString().slice(-6)}`,
         },
         async () => {
-          const { error } = await supabase!.from('demo_transactions').insert({
-            user_id: user!.id,
-            type,
-            amount: num,
-            method: type === 'withdraw_demo' && bankCard ? `${bankCard.wallet_method} (${bankCard.wallet_number})` : method,
-            reference_code: referenceCode || `TRX-${Date.now().toString().slice(-6)}`,
-            status: 'pending',
-            admin_note: type === 'withdraw_demo' ? `5% চার্জ: ৳${(num * 0.05).toFixed(2)}` : 'আপনার পেমেন্টটি পর্যালোচনায় রয়েছে',
+          const { data, error } = await supabase!.rpc('request_demo_transaction', {
+            p_type: type,
+            p_amount: num,
+            p_method: type === 'withdraw_demo' && bankCard ? `${bankCard.wallet_method} (${bankCard.wallet_number})` : method,
+            p_reference_code:
+              type === 'withdraw_demo' && bankCard
+                ? bankCard.account_name
+                : referenceCode.trim() || `TRX-${Date.now().toString().slice(-6)}`,
           });
           if (error) throw new Error(error.message);
-          return { ok: true };
+          return (data as Record<string, unknown>) || { ok: true };
         }
       );
 

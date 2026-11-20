@@ -799,7 +799,7 @@ async function startServer() {
       const [plansRes, settingsRes, profilesRes, txRes] = await Promise.all([
         dbClient.from('plans').select('title').order('sort_order', { ascending: true }),
         dbClient.from('site_settings').select('id').limit(1),
-        dbClient.from('profiles').select('id').limit(1),
+        dbClient.from('profiles').select('id,phone,referral_code,referred_by,demo_balance').limit(1),
         dbClient.from('demo_transactions').select('id').limit(1),
       ]);
 
@@ -813,10 +813,16 @@ async function startServer() {
         };
       }
       if (isMissingTableError(settingsRes.error)) missingTables.push('site_settings');
-      if (isMissingTableError(profilesRes.error)) missingTables.push('profiles');
+      if (profilesRes.error) {
+        missingTables.push(
+          isMissingTableError(profilesRes.error)
+            ? 'profiles'
+            : `profiles (${profilesRes.error.message})`
+        );
+      }
       if (isMissingTableError(txRes.error)) missingTables.push('demo_transactions');
 
-      schemaReady = !plansRes.error && !isMissingTableError(settingsRes.error);
+      schemaReady = !plansRes.error && !isMissingTableError(settingsRes.error) && !profilesRes.error;
     }
 
     res.json({
@@ -929,6 +935,7 @@ async function startServer() {
         return;
       }
 
+      let uid: string | undefined;
       const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
         email,
         password,
@@ -946,30 +953,48 @@ async function startServer() {
           res.status(409).json({ error: 'এই নম্বরটি ইতিমধ্যে নিবন্ধিত। অনুগ্রহ করে লগইন করুন।' });
           return;
         }
-        res.status(400).json({ error: createErr.message });
-        return;
+        const { data: rpcData, error: rpcErr } = await supabaseAdmin.rpc('register_phone_user', {
+          p_phone: rawPhone,
+          p_password: password,
+          p_referral_code: referralCode,
+        });
+        if (rpcErr) {
+          const rMsg = rpcErr.message.toLowerCase();
+          if (rMsg.includes('already registered') || rMsg.includes('duplicate')) {
+            res.status(409).json({ error: 'এই নম্বরটি ইতিমধ্যে নিবন্ধিত। অনুগ্রহ করে লগইন করুন।' });
+            return;
+          }
+          res.status(400).json({ error: `${createErr.message} (${rpcErr.message})` });
+          return;
+        }
+        uid =
+          rpcData && typeof rpcData === 'object' && 'user_id' in rpcData
+            ? String((rpcData as { user_id: string }).user_id)
+            : undefined;
+      } else {
+        uid = created.user?.id;
       }
 
-      const uid = created.user?.id;
       if (uid) {
         const { data: profCheck } = await supabaseAdmin
           .from('profiles')
-          .select('id')
+          .select('id, referred_by')
           .eq('id', uid)
           .maybeSingle();
+
+        let referrerId: string | null = profCheck?.referred_by ?? null;
+        if (!referrerId && referralCode) {
+          const { data: refProf } = await supabaseAdmin
+            .from('profiles')
+            .select('id, referred_by')
+            .ilike('referral_code', referralCode)
+            .maybeSingle();
+          referrerId = refProf?.id ?? null;
+        }
 
         if (!profCheck) {
           const scaniaId = `SCN${Math.floor(100000 + Math.random() * 900000)}`;
           const refCode = `SCN${uid.replace(/-/g, '').slice(0, 6).toUpperCase()}`;
-          let referrerId: string | null = null;
-          if (referralCode) {
-            const { data: refProf } = await supabaseAdmin
-              .from('profiles')
-              .select('id')
-              .eq('referral_code', referralCode)
-              .maybeSingle();
-            referrerId = refProf?.id ?? null;
-          }
           await supabaseAdmin.from('profiles').insert({
             id: uid,
             scania_id: scaniaId,
@@ -982,9 +1007,60 @@ async function startServer() {
             demo_bonus: 150,
           });
           await supabaseAdmin.from('user_roles').upsert({ user_id: uid, role: 'user' }, { onConflict: 'user_id' });
+        } else if (referrerId && !profCheck.referred_by) {
+          await supabaseAdmin.from('profiles').update({ referred_by: referrerId }).eq('id', uid);
+        }
+
+        if (referrerId && referrerId !== uid) {
+          await supabaseAdmin.from('referral_records').upsert(
+            {
+              referrer_id: referrerId,
+              referred_user_id: uid,
+              level: 1,
+              commission_rate: 25,
+              simulated_commission: 0,
+            },
+            { onConflict: 'referrer_id,referred_user_id', ignoreDuplicates: true }
+          );
+
+          const { data: l1Prof } = await supabaseAdmin
+            .from('profiles')
+            .select('referred_by')
+            .eq('id', referrerId)
+            .maybeSingle();
+          if (l1Prof?.referred_by && l1Prof.referred_by !== uid) {
+            await supabaseAdmin.from('referral_records').upsert(
+              {
+                referrer_id: l1Prof.referred_by,
+                referred_user_id: uid,
+                level: 2,
+                commission_rate: 2,
+                simulated_commission: 0,
+              },
+              { onConflict: 'referrer_id,referred_user_id', ignoreDuplicates: true }
+            );
+            const { data: l2Prof } = await supabaseAdmin
+              .from('profiles')
+              .select('referred_by')
+              .eq('id', l1Prof.referred_by)
+              .maybeSingle();
+            if (l2Prof?.referred_by && l2Prof.referred_by !== uid) {
+              await supabaseAdmin.from('referral_records').upsert(
+                {
+                  referrer_id: l2Prof.referred_by,
+                  referred_user_id: uid,
+                  level: 3,
+                  commission_rate: 1,
+                  simulated_commission: 0,
+                },
+                { onConflict: 'referrer_id,referred_user_id', ignoreDuplicates: true }
+              );
+            }
+          }
         }
       }
 
+      broadcastRefresh('user_registered');
       res.json({ ok: true, mode: 'supabase', email });
       return;
     }
@@ -1509,9 +1585,15 @@ async function startServer() {
       }
 
       const member = members[idx];
-      if (type === 'withdraw_demo' && Number(member.demo_balance) < parsedAmount) {
-        res.status(400).json({ error: 'আপনার ব্যালেন্স পর্যাপ্ত নয়।' });
-        return;
+      if (type === 'withdraw_demo') {
+        if (Number(member.demo_balance) < parsedAmount) {
+          res.status(400).json({ error: 'আপনার ব্যালেন্স পর্যাপ্ত নয়।' });
+          return;
+        }
+        member.demo_balance = Number((Number(member.demo_balance) - parsedAmount).toFixed(2));
+        member.updated_at = nowIso;
+        members[idx] = member;
+        writeServerMembers(members);
       }
 
       const bankCard = store.bankCards[uid];
@@ -1549,7 +1631,7 @@ async function startServer() {
       const notifMessage =
         type === 'deposit_demo'
           ? `আপনার পেমেন্টটি পর্যালোচনায় রয়েছে (${parsedAmount} টাকা · ${txMethod} · TrxID: ${txRef})।`
-          : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা · 5% চার্জ বাদে প্রাপ্তি ${(parsedAmount * 0.95).toFixed(2)} টাকা)।`;
+          : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা ব্যালেন্স থেকে কাটা হয়েছে · 5% চার্জ বাদে প্রাপ্তি ${(parsedAmount * 0.95).toFixed(2)} টাকা)।`;
 
       store.notifications.unshift({
         id: crypto.randomUUID(),
@@ -1590,9 +1672,21 @@ async function startServer() {
       return;
     }
 
-    if (type === 'withdraw_demo' && Number(profile.demo_balance) < parsedAmount) {
-      res.status(400).json({ error: 'আপনার ব্যালেন্স পর্যাপ্ত নয়।' });
-      return;
+    const currentBal = Number(profile.demo_balance || 0);
+    if (type === 'withdraw_demo') {
+      if (currentBal < parsedAmount) {
+        res.status(400).json({ error: 'আপনার ব্যালেন্স পর্যাপ্ত নয়।' });
+        return;
+      }
+      const nextBal = Number((currentBal - parsedAmount).toFixed(2));
+      const { error: deductErr } = await supabaseAdmin
+        .from('profiles')
+        .update({ demo_balance: nextBal, updated_at: nowIso })
+        .eq('id', uid);
+      if (deductErr) {
+        res.status(400).json({ error: deductErr.message });
+        return;
+      }
     }
 
     const bankCard = store.bankCards[uid];
@@ -1622,6 +1716,12 @@ async function startServer() {
       .single();
 
     if (error) {
+      if (type === 'withdraw_demo') {
+        await supabaseAdmin
+          .from('profiles')
+          .update({ demo_balance: currentBal, updated_at: new Date().toISOString() })
+          .eq('id', uid);
+      }
       res.status(400).json({ error: error.message });
       return;
     }
@@ -1634,7 +1734,7 @@ async function startServer() {
       message:
         type === 'deposit_demo'
           ? `আপনার পেমেন্টটি পর্যালোচনায় রয়েছে (${parsedAmount} টাকা)।`
-          : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা · 5% চার্জ: ${fee} টাকা)।`,
+          : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা ব্যালেন্স থেকে কাটা হয়েছে · 5% চার্জ: ${fee} টাকা)।`,
       category: 'transaction',
     });
 
@@ -2806,14 +2906,14 @@ async function startServer() {
               }
             }
           }
-        } else if (tx.type === 'withdraw_demo') {
-          if (Number(member.demo_balance) < txAmount) {
-            res.status(400).json({ error: 'User balance is lower than withdrawal request amount.' });
-            return;
-          }
-          member.demo_balance = Number((Number(member.demo_balance) - txAmount).toFixed(2));
-          member.updated_at = nowIso;
+          members[memberIdx] = member;
+          writeServerMembers(members);
         }
+        // Note: For withdraw_demo, balance was already deducted on submission.
+      } else if (decision === 'rejected' && tx.type === 'withdraw_demo') {
+        // Refund deducted balance back to user if withdrawal is rejected
+        member.demo_balance = Number((Number(member.demo_balance) + txAmount).toFixed(2));
+        member.updated_at = nowIso;
         members[memberIdx] = member;
         writeServerMembers(members);
       }
@@ -2833,7 +2933,7 @@ async function startServer() {
             : 'আপনার উত্তোলন সফল হয়েছে'
           : tx.type === 'deposit_demo'
           ? 'আপনার রিচার্জ ব্যর্থ হয়েছে'
-          : 'আপনার উত্তোলন ব্যর্থ হয়েছে';
+          : 'আপনার উত্তোলন বাতিল ও ব্যালেন্স ফেরত দেওয়া হয়েছে';
 
       store.notifications.unshift({
         id: crypto.randomUUID(),
@@ -2871,72 +2971,82 @@ async function startServer() {
       return;
     }
 
-    if (decision === 'approved') {
-      const { data: profile } = await supabaseAdmin
+    const txAmount = Number(tx.amount);
+    const { data: profile } = await supabaseAdmin
+      .from('profiles')
+      .select('demo_balance, referred_by, full_name, scania_id')
+      .eq('id', tx.user_id)
+      .single();
+
+    if (!profile) {
+      res.status(404).json({ error: 'User profile not found.' });
+      return;
+    }
+
+    const currentBal = Number(profile.demo_balance || 0);
+
+    if (decision === 'approved' && tx.type === 'deposit_demo') {
+      await supabaseAdmin
         .from('profiles')
-        .select('demo_balance, referred_by, full_name, scania_id')
-        .eq('id', tx.user_id)
-        .single();
+        .update({ demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: new Date().toISOString() })
+        .eq('id', tx.user_id);
 
-      if (!profile) {
-        res.status(404).json({ error: 'User profile not found.' });
-        return;
-      }
-
-      const currentBal = Number(profile.demo_balance);
-      const txAmount = Number(tx.amount);
-      if (tx.type === 'deposit_demo') {
-        await supabaseAdmin
+      if (profile.referred_by) {
+        const comm = Number((txAmount * 0.25).toFixed(2));
+        const { data: refProf } = await supabaseAdmin
           .from('profiles')
-          .update({ demo_balance: currentBal + txAmount, updated_at: new Date().toISOString() })
-          .eq('id', tx.user_id);
-
-        if (profile.referred_by) {
-          const comm = Number((txAmount * 0.25).toFixed(2));
-          const { data: refProf } = await supabaseAdmin
+          .select('id, demo_balance')
+          .eq('id', profile.referred_by)
+          .maybeSingle();
+        if (refProf && comm > 0) {
+          await supabaseAdmin
             .from('profiles')
-            .select('id, demo_balance')
-            .eq('id', profile.referred_by)
+            .update({ demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)), updated_at: new Date().toISOString() })
+            .eq('id', refProf.id);
+          const { data: refRec } = await supabaseAdmin
+            .from('referral_records')
+            .select('id, simulated_commission')
+            .eq('referrer_id', refProf.id)
+            .eq('referred_user_id', tx.user_id)
+            .eq('level', 1)
             .maybeSingle();
-          if (refProf && comm > 0) {
+          if (refRec) {
             await supabaseAdmin
-              .from('profiles')
-              .update({ demo_balance: Number(refProf.demo_balance) + comm, updated_at: new Date().toISOString() })
-              .eq('id', refProf.id);
-            const { data: refRec } = await supabaseAdmin
               .from('referral_records')
-              .select('id, simulated_commission')
-              .eq('referrer_id', refProf.id)
-              .eq('referred_user_id', tx.user_id)
-              .eq('level', 1)
-              .maybeSingle();
-            if (refRec) {
-              await supabaseAdmin
-                .from('referral_records')
-                .update({ simulated_commission: Number(refRec.simulated_commission) + comm })
-                .eq('id', refRec.id);
-            }
-            await supabaseAdmin.from('demo_transactions').insert({
-              user_id: refProf.id,
-              type: 'referral_commission',
-              amount: comm,
-              method: 'লেভেল 1 রেফারেল (25%)',
-              reference_code: profile.scania_id,
-              status: 'completed',
-              admin_note: 'ডিপোজিট কনফার্ম কমিশন যুক্ত হয়েছে',
+              .update({ simulated_commission: Number((Number(refRec.simulated_commission) + comm).toFixed(2)) })
+              .eq('id', refRec.id);
+          } else {
+            await supabaseAdmin.from('referral_records').insert({
+              referrer_id: refProf.id,
+              referred_user_id: tx.user_id,
+              level: 1,
+              commission_rate: 25,
+              simulated_commission: comm,
             });
           }
+          await supabaseAdmin.from('demo_transactions').insert({
+            user_id: refProf.id,
+            type: 'referral_commission',
+            amount: comm,
+            method: 'লেভেল 1 রেফারেল (25%)',
+            reference_code: profile.scania_id,
+            status: 'completed',
+            admin_note: `${profile.full_name} এর রিচার্জ থেকে 25% কমিশন`,
+          });
+          await supabaseAdmin.from('notifications').insert({
+            user_id: refProf.id,
+            title: 'টিম কমিশন যুক্ত হয়েছে (25%)',
+            message: `${profile.full_name} এর ${txAmount} টাকা রিচার্জ কনফার্ম হওয়ায় ${comm} টাকা কমিশন আপনার ব্যালেন্সে যোগ হয়েছে।`,
+            category: 'bonus',
+          });
         }
-      } else if (tx.type === 'withdraw_demo') {
-        if (currentBal < txAmount) {
-          res.status(400).json({ error: 'User balance is lower than withdrawal request amount.' });
-          return;
-        }
-        await supabaseAdmin
-          .from('profiles')
-          .update({ demo_balance: currentBal - txAmount, updated_at: new Date().toISOString() })
-          .eq('id', tx.user_id);
       }
+    } else if (decision === 'rejected' && tx.type === 'withdraw_demo') {
+      // Refund deducted withdrawal balance back to user
+      await supabaseAdmin
+        .from('profiles')
+        .update({ demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: new Date().toISOString() })
+        .eq('id', tx.user_id);
     }
 
     const { data: updated, error: updErr } = await supabaseAdmin
@@ -2963,7 +3073,7 @@ async function startServer() {
           : 'আপনার উত্তোলন সফল হয়েছে'
         : tx.type === 'deposit_demo'
         ? 'আপনার রিচার্জ ব্যর্থ হয়েছে'
-        : 'আপনার উত্তোলন ব্যর্থ হয়েছে';
+        : 'আপনার উত্তোলন বাতিল ও ব্যালেন্স ফেরত দেওয়া হয়েছে';
 
     await supabaseAdmin.from('notifications').insert({
       user_id: tx.user_id,

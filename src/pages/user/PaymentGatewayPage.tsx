@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Navigate, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   ArrowLeft,
   Banknote,
@@ -16,7 +16,6 @@ import {
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
 import { callApiWithFallback, getStoredServerToken, supabase } from '../../lib/supabase';
-import { savePreviewDepositTransaction } from '../../lib/localFallbackStore';
 import { useToast } from '../../components/ui/Feedback';
 
 interface BrandTheme {
@@ -71,7 +70,7 @@ const BRAND_THEMES: Record<'bKash' | 'Nagad', BrandTheme> = {
 export const PaymentGatewayPage: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
-  const { user, profile, isPreviewMode, refreshProfile } = useAuth();
+  const { user, profile, loading, refreshProfile } = useAuth();
   const { siteSettings, refreshAll } = usePlatformData();
   const { showToast } = useToast();
 
@@ -112,8 +111,7 @@ export const PaymentGatewayPage: React.FC = () => {
 
     const sessionToken = getStoredServerToken();
 
-    // Require login only when running live Supabase without session, or after explicit logout
-    if ((!isPreviewMode && !user) || (isPreviewMode && !profile && !sessionToken)) {
+    if (!user || !profile) {
       showToast('অনুগ্রহ করে প্রথমে লগইন করুন', 'warning');
       navigate('/login');
       return;
@@ -121,42 +119,31 @@ export const PaymentGatewayPage: React.FC = () => {
 
     setSubmitting(true);
     try {
-      const canCallBackend =
-        Boolean(sessionToken && !sessionToken.startsWith('local:')) || Boolean(!isPreviewMode && user);
+      const canCallBackend = Boolean(sessionToken && !sessionToken.startsWith('local:')) || Boolean(supabase && user);
+      if (!canCallBackend) {
+        throw new Error('পেমেন্ট জমা দিতে অনুগ্রহ করে আবার লগইন করুন।');
+      }
 
-      if (canCallBackend) {
-        await callApiWithFallback(
-          '/api/user/request-transaction',
-          'POST',
-          {
-            type: 'deposit_demo',
-            amount,
-            method: methodParam,
-            reference_code: cleanTrx,
-          },
-          async () => {
-            const { error } = await supabase!.from('demo_transactions').insert({
-              user_id: user!.id,
-              type: 'deposit_demo',
-              amount,
-              method: methodParam,
-              reference_code: cleanTrx,
-              status: 'pending',
-              admin_note: 'আপনার পেমেন্টটি পর্যালোচনায় রয়েছে',
-            });
-            if (error) throw new Error(error.message);
-            return { ok: true };
-          }
-        );
-      } else {
-        // Preview / local resilient submission when browsing directly without prior signup
-        savePreviewDepositTransaction({
-          userId: profile?.id || 'preview-user-1',
+      await callApiWithFallback(
+        '/api/user/request-transaction',
+        'POST',
+        {
+          type: 'deposit_demo',
           amount,
           method: methodParam,
-          referenceCode: cleanTrx,
-        });
-      }
+          reference_code: cleanTrx,
+        },
+        async () => {
+          const { data, error } = await supabase!.rpc('request_demo_transaction', {
+            p_type: 'deposit_demo',
+            p_amount: amount,
+            p_method: methodParam,
+            p_reference_code: cleanTrx,
+          });
+          if (error) throw new Error(error.message);
+          return (data as Record<string, unknown>) || { ok: true };
+        }
+      );
 
       await Promise.all([refreshProfile(), refreshAll()]);
       showToast(
@@ -170,6 +157,18 @@ export const PaymentGatewayPage: React.FC = () => {
       setSubmitting(false);
     }
   };
+
+  if (loading) {
+    return (
+      <div className={`min-h-[100dvh] ${theme.pageBg} flex items-center justify-center text-sm font-semibold text-slate-600`}>
+        লোড হচ্ছে...
+      </div>
+    );
+  }
+
+  if (!user || !profile) {
+    return <Navigate to="/login" replace />;
+  }
 
   // Dedicated Post-Submit Notification Page with bKash / Nagad Logo
   if (submittedPending) {

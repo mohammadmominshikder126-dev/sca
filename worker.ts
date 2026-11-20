@@ -744,7 +744,7 @@ export default {
         const [plansRes, settingsRes, profilesRes, txRes] = await Promise.all([
           sbRest<{ title: string }[]>(sb, 'plans?select=title&order=sort_order.asc', { useService }),
           sbRest<unknown[]>(sb, 'site_settings?select=id&limit=1', { useService }),
-          sbRest<unknown[]>(sb, 'profiles?select=id&limit=1', { useService }),
+          sbRest<unknown[]>(sb, 'profiles?select=id,phone,referral_code,referred_by,demo_balance&limit=1', { useService }),
           sbRest<unknown[]>(sb, 'demo_transactions?select=id&limit=1', { useService }),
         ]);
 
@@ -756,9 +756,11 @@ export default {
           plansStatus = { count: rows.length, titles: rows.map((p) => p.title) };
         }
         if (settingsRes.error && isMissingTableMsg(settingsRes.error)) missingTables.push('site_settings');
-        if (profilesRes.error && isMissingTableMsg(profilesRes.error)) missingTables.push('profiles');
+        if (profilesRes.error) {
+          missingTables.push(isMissingTableMsg(profilesRes.error) ? 'profiles' : `profiles (${profilesRes.error})`);
+        }
         if (txRes.error && isMissingTableMsg(txRes.error)) missingTables.push('demo_transactions');
-        schemaReady = !plansRes.error && !(settingsRes.error && isMissingTableMsg(settingsRes.error));
+        schemaReady = !plansRes.error && !(settingsRes.error && isMissingTableMsg(settingsRes.error)) && !profilesRes.error;
       }
 
       return jsonResponse({
@@ -892,23 +894,24 @@ export default {
         if (createRes.ok) {
           const uid = createdJson.id || createdJson.user?.id;
           if (uid) {
-            const profCheck = await sbRest<{ id: string }[]>(
+            const profCheck = await sbRest<{ id: string; referred_by?: string | null }[]>(
               sb,
-              `profiles?select=id&id=eq.${encodeURIComponent(uid)}&limit=1`,
+              `profiles?select=id,referred_by&id=eq.${encodeURIComponent(uid)}&limit=1`,
               { useService: true }
             );
-            if (!profCheck.error && (!profCheck.data || profCheck.data.length === 0)) {
+            const existingProf = profCheck.data?.[0];
+            let referrerId: string | null = existingProf?.referred_by ?? null;
+            if (!referrerId && referralCode) {
+              const refProf = await sbRest<{ id: string }[]>(
+                sb,
+                `profiles?select=id&referral_code=ilike.${encodeURIComponent(referralCode)}&limit=1`,
+                { useService: true }
+              );
+              referrerId = refProf.data?.[0]?.id ?? null;
+            }
+            if (!existingProf) {
               const scaniaId = `SCN${Math.floor(100000 + Math.random() * 900000)}`;
               const refCode = `SCN${uid.replace(/-/g, '').slice(0, 6).toUpperCase()}`;
-              let referrerId: string | null = null;
-              if (referralCode) {
-                const refProf = await sbRest<{ id: string }[]>(
-                  sb,
-                  `profiles?select=id&referral_code=eq.${encodeURIComponent(referralCode)}&limit=1`,
-                  { useService: true }
-                );
-                referrerId = refProf.data?.[0]?.id ?? null;
-              }
               await sbRest(sb, 'profiles', {
                 method: 'POST',
                 useService: true,
@@ -930,6 +933,66 @@ export default {
                 prefer: 'resolution=ignore-duplicates',
                 body: { user_id: uid, role: 'user' },
               });
+            } else if (referrerId && !existingProf.referred_by) {
+              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(uid)}`, {
+                method: 'PATCH',
+                useService: true,
+                body: { referred_by: referrerId },
+              });
+            }
+            if (referrerId && referrerId !== uid) {
+              await sbRest(sb, 'referral_records?on_conflict=referrer_id,referred_user_id', {
+                method: 'POST',
+                useService: true,
+                prefer: 'resolution=ignore-duplicates',
+                body: {
+                  referrer_id: referrerId,
+                  referred_user_id: uid,
+                  level: 1,
+                  commission_rate: 25,
+                  simulated_commission: 0,
+                },
+              });
+              const l1Prof = await sbRest<{ referred_by: string | null }[]>(
+                sb,
+                `profiles?select=referred_by&id=eq.${encodeURIComponent(referrerId)}&limit=1`,
+                { useService: true }
+              );
+              const l2Id = l1Prof.data?.[0]?.referred_by;
+              if (l2Id && l2Id !== uid) {
+                await sbRest(sb, 'referral_records?on_conflict=referrer_id,referred_user_id', {
+                  method: 'POST',
+                  useService: true,
+                  prefer: 'resolution=ignore-duplicates',
+                  body: {
+                    referrer_id: l2Id,
+                    referred_user_id: uid,
+                    level: 2,
+                    commission_rate: 2,
+                    simulated_commission: 0,
+                  },
+                });
+                const l2Prof = await sbRest<{ referred_by: string | null }[]>(
+                  sb,
+                  `profiles?select=referred_by&id=eq.${encodeURIComponent(l2Id)}&limit=1`,
+                  { useService: true }
+                );
+                const l3Id = l2Prof.data?.[0]?.referred_by;
+                if (l3Id && l3Id !== uid) {
+                  await sbRest(sb, 'referral_records?on_conflict=referrer_id,referred_user_id', {
+                    method: 'POST',
+                    useService: true,
+                    prefer: 'resolution=ignore-duplicates',
+                    body: {
+                      referrer_id: l3Id,
+                      referred_user_id: uid,
+                      level: 3,
+                      commission_rate: 1,
+                      simulated_commission: 0,
+                    },
+                  });
+                }
+              }
             }
           }
           return jsonResponse({ ok: true, mode: 'supabase', email: sbEmail });
@@ -1395,6 +1458,19 @@ export default {
             ? 'আপনার পেমেন্টটি পর্যালোচনায় রয়েছে'
             : `5% চার্জ: ৳${fee} · প্রাপ্তি: ৳${net}`;
 
+        const previousBalance = Number(prof.demo_balance || 0);
+        if (type === 'withdraw_demo') {
+          const nextBalance = Number((previousBalance - parsedAmount).toFixed(2));
+          const balRes = await sbRest(sb, `profiles?id=eq.${encodeURIComponent(uid)}`, {
+            method: 'PATCH',
+            useService: true,
+            body: { demo_balance: nextBalance },
+          });
+          if (balRes.error) {
+            return jsonResponse({ error: balRes.error || 'ব্যালেন্স আপডেট করা যায়নি।' }, 400);
+          }
+        }
+
         const txInsert = await sbRest<WorkerTransaction[]>(sb, 'demo_transactions', {
           method: 'POST',
           useService: true,
@@ -1410,6 +1486,13 @@ export default {
           },
         });
         if (txInsert.error) {
+          if (type === 'withdraw_demo') {
+            await sbRest(sb, `profiles?id=eq.${encodeURIComponent(uid)}`, {
+              method: 'PATCH',
+              useService: true,
+              body: { demo_balance: previousBalance },
+            });
+          }
           return jsonResponse({ error: txInsert.error }, 400);
         }
         const notifTitle =
@@ -1423,7 +1506,7 @@ export default {
             message:
               type === 'deposit_demo'
                 ? `আপনার পেমেন্টটি পর্যালোচনায় রয়েছে (${parsedAmount} টাকা)।`
-                : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা · 5% চার্জ: ${fee} টাকা)।`,
+                : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা কেটে নেওয়া হয়েছে · 5% চার্জ: ${fee} টাকা)।`,
             category: 'transaction',
           },
         });
@@ -1457,6 +1540,8 @@ export default {
         txMethod = bankCard ? `${bankCard.wallet_method} (${bankCard.wallet_number})` : txMethod;
         txRef = bankCard ? bankCard.account_name : txRef;
         txNote = `5% চার্জ: ৳${fee} · প্রাপ্তি: ৳${net}`;
+        member.demo_balance = Number((Number(member.demo_balance || 0) - parsedAmount).toFixed(2));
+        member.updated_at = nowIso;
       }
 
       const newTx: WorkerTransaction = {
@@ -1483,7 +1568,7 @@ export default {
         message:
           type === 'deposit_demo'
             ? `আপনার পেমেন্টটি পর্যালোচনায় রয়েছে (${parsedAmount} টাকা · ${txMethod} · TrxID: ${txRef})।`
-            : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা)।`,
+            : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা কেটে নেওয়া হয়েছে)।`,
         category: 'transaction',
         is_read: false,
         created_at: nowIso,
@@ -2388,61 +2473,91 @@ export default {
           const nowIso = new Date().toISOString();
           const txAmount = Number(sbTx.amount);
 
-          if (decision === 'approved') {
-            const profRes = await sbRest<{ id: string; demo_balance: number; referred_by: string | null; full_name: string; scania_id: string }[]>(
-              sb,
-              `profiles?select=id,demo_balance,referred_by,full_name,scania_id&id=eq.${encodeURIComponent(sbTx.user_id)}&limit=1`,
-              { useService: true }
-            );
-            const prof = profRes.data?.[0];
-            if (!prof) return jsonResponse({ error: 'User profile not found.' }, 404);
-            const currentBal = Number(prof.demo_balance || 0);
+          const profRes = await sbRest<{ id: string; demo_balance: number; referred_by: string | null; full_name: string; scania_id: string }[]>(
+            sb,
+            `profiles?select=id,demo_balance,referred_by,full_name,scania_id&id=eq.${encodeURIComponent(sbTx.user_id)}&limit=1`,
+            { useService: true }
+          );
+          const prof = profRes.data?.[0];
+          if (!prof) return jsonResponse({ error: 'User profile not found.' }, 404);
+          const currentBal = Number(prof.demo_balance || 0);
 
-            if (sbTx.type === 'deposit_demo') {
-              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
-                method: 'PATCH',
-                useService: true,
-                body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
-              });
-              if (prof.referred_by) {
-                const comm = Number((txAmount * 0.25).toFixed(2));
-                const refProfRes = await sbRest<{ id: string; demo_balance: number }[]>(
+          if (decision === 'approved' && sbTx.type === 'deposit_demo') {
+            await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
+              method: 'PATCH',
+              useService: true,
+              body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
+            });
+            if (prof.referred_by) {
+              const comm = Number((txAmount * 0.25).toFixed(2));
+              const refProfRes = await sbRest<{ id: string; demo_balance: number }[]>(
+                sb,
+                `profiles?select=id,demo_balance&id=eq.${encodeURIComponent(prof.referred_by)}&limit=1`,
+                { useService: true }
+              );
+              const refProf = refProfRes.data?.[0];
+              if (refProf && comm > 0) {
+                await sbRest(sb, `profiles?id=eq.${encodeURIComponent(refProf.id)}`, {
+                  method: 'PATCH',
+                  useService: true,
+                  body: { demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)), updated_at: nowIso },
+                });
+                const refRecRes = await sbRest<{ id: string; simulated_commission: number }[]>(
                   sb,
-                  `profiles?select=id,demo_balance&id=eq.${encodeURIComponent(prof.referred_by)}&limit=1`,
+                  `referral_records?select=id,simulated_commission&referrer_id=eq.${encodeURIComponent(refProf.id)}&referred_user_id=eq.${encodeURIComponent(sbTx.user_id)}&level=eq.1&limit=1`,
                   { useService: true }
                 );
-                const refProf = refProfRes.data?.[0];
-                if (refProf && comm > 0) {
-                  await sbRest(sb, `profiles?id=eq.${encodeURIComponent(refProf.id)}`, {
+                const refRec = refRecRes.data?.[0];
+                if (refRec) {
+                  await sbRest(sb, `referral_records?id=eq.${encodeURIComponent(refRec.id)}`, {
                     method: 'PATCH',
                     useService: true,
-                    body: { demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)), updated_at: nowIso },
+                    body: { simulated_commission: Number((Number(refRec.simulated_commission || 0) + comm).toFixed(2)) },
                   });
-                  await sbRest(sb, 'demo_transactions', {
+                } else {
+                  await sbRest(sb, 'referral_records', {
                     method: 'POST',
                     useService: true,
                     body: {
-                      user_id: refProf.id,
-                      type: 'referral_commission',
-                      amount: comm,
-                      method: 'লেভেল 1 রেফারেল (25%)',
-                      reference_code: prof.scania_id,
-                      status: 'completed',
-                      admin_note: 'ডিপোজিট কনফার্ম কমিশন যুক্ত হয়েছে',
+                      referrer_id: refProf.id,
+                      referred_user_id: sbTx.user_id,
+                      level: 1,
+                      commission_rate: 25,
+                      simulated_commission: comm,
                     },
                   });
                 }
+                await sbRest(sb, 'demo_transactions', {
+                  method: 'POST',
+                  useService: true,
+                  body: {
+                    user_id: refProf.id,
+                    type: 'referral_commission',
+                    amount: comm,
+                    method: 'লেভেল 1 রেফারেল (25%)',
+                    reference_code: prof.scania_id,
+                    status: 'completed',
+                    admin_note: `${prof.full_name} এর রিচার্জ থেকে 25% কমিশন`,
+                  },
+                });
+                await sbRest(sb, 'notifications', {
+                  method: 'POST',
+                  useService: true,
+                  body: {
+                    user_id: refProf.id,
+                    title: 'টিম কমিশন যুক্ত হয়েছে (25%)',
+                    message: `${prof.full_name} এর ${txAmount} টাকা রিচার্জ কনফার্ম হওয়ায় ${comm} টাকা কমিশন আপনার ব্যালেন্সে যোগ হয়েছে।`,
+                    category: 'bonus',
+                  },
+                });
               }
-            } else if (sbTx.type === 'withdraw_demo') {
-              if (currentBal < txAmount) {
-                return jsonResponse({ error: 'User balance is lower than withdrawal request amount.' }, 400);
-              }
-              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
-                method: 'PATCH',
-                useService: true,
-                body: { demo_balance: Number((currentBal - txAmount).toFixed(2)), updated_at: nowIso },
-              });
             }
+          } else if (decision === 'rejected' && sbTx.type === 'withdraw_demo') {
+            await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
+              method: 'PATCH',
+              useService: true,
+              body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
+            });
           }
 
           const updRes = await sbRest<WorkerTransaction[]>(
@@ -2468,7 +2583,7 @@ export default {
                 : 'আপনার উত্তোলন সফল হয়েছে'
               : sbTx.type === 'deposit_demo'
               ? 'আপনার রিচার্জ ব্যর্থ হয়েছে'
-              : 'আপনার উত্তোলন ব্যর্থ হয়েছে';
+              : 'আপনার উত্তোলন বাতিল ও ব্যালেন্স ফেরত দেওয়া হয়েছে';
 
           await sbRest(sb, 'notifications', {
             method: 'POST',
@@ -2496,40 +2611,62 @@ export default {
       const txAmount = Number(tx.amount);
       const nowIso = new Date().toISOString();
 
-      if (decision === 'approved') {
-        if (tx.type === 'deposit_demo') {
-          member.demo_balance = Number((Number(member.demo_balance) + txAmount).toFixed(2));
-          member.updated_at = nowIso;
-          if (member.referred_by) {
-            const refIdx = state.members.findIndex((m) => m.id === member.referred_by);
-            if (refIdx !== -1) {
-              const comm = Number((txAmount * 0.25).toFixed(2));
-              if (comm > 0) {
-                state.members[refIdx].demo_balance = Number((Number(state.members[refIdx].demo_balance) + comm).toFixed(2));
-                state.members[refIdx].updated_at = nowIso;
-                state.transactions.unshift({
+      if (decision === 'approved' && tx.type === 'deposit_demo') {
+        member.demo_balance = Number((Number(member.demo_balance) + txAmount).toFixed(2));
+        member.updated_at = nowIso;
+        if (member.referred_by) {
+          const refIdx = state.members.findIndex((m) => m.id === member.referred_by);
+          if (refIdx !== -1) {
+            const comm = Number((txAmount * 0.25).toFixed(2));
+            if (comm > 0) {
+              state.members[refIdx].demo_balance = Number((Number(state.members[refIdx].demo_balance) + comm).toFixed(2));
+              state.members[refIdx].updated_at = nowIso;
+              const recIdx = state.referrals.findIndex(
+                (r) => r.referrer_id === state.members[refIdx].id && r.referred_user_id === member.id && r.level === 1
+              );
+              if (recIdx !== -1) {
+                state.referrals[recIdx].simulated_commission = Number(
+                  (Number(state.referrals[recIdx].simulated_commission) + comm).toFixed(2)
+                );
+              } else {
+                state.referrals.push({
                   id: crypto.randomUUID(),
-                  user_id: state.members[refIdx].id,
-                  type: 'referral_commission',
-                  amount: comm,
-                  method: 'লেভেল 1 রেফারেল (25%)',
-                  reference_code: member.scania_id,
-                  status: 'completed',
-                  admin_note: `${member.full_name} এর রিচার্জ থেকে 25% কমিশন`,
-                  processed_by: admin.uid,
+                  referrer_id: state.members[refIdx].id,
+                  referred_user_id: member.id,
+                  level: 1,
+                  commission_rate: 25,
+                  simulated_commission: comm,
                   created_at: nowIso,
-                  updated_at: nowIso,
                 });
               }
+              state.transactions.unshift({
+                id: crypto.randomUUID(),
+                user_id: state.members[refIdx].id,
+                type: 'referral_commission',
+                amount: comm,
+                method: 'লেভেল 1 রেফারেল (25%)',
+                reference_code: member.scania_id,
+                status: 'completed',
+                admin_note: `${member.full_name} এর রিচার্জ থেকে 25% কমিশন`,
+                processed_by: admin.uid,
+                created_at: nowIso,
+                updated_at: nowIso,
+              });
+              state.notifications.unshift({
+                id: crypto.randomUUID(),
+                user_id: state.members[refIdx].id,
+                title: 'টিম কমিশন যুক্ত হয়েছে (25%)',
+                message: `${member.full_name} এর ${txAmount} টাকা ডিপোজিট কনফার্ম হওয়ায় ${comm} টাকা কমিশন আপনার ব্যালেন্সে যোগ হয়েছে।`,
+                category: 'bonus',
+                is_read: false,
+                created_at: nowIso,
+              });
             }
           }
-        } else if (tx.type === 'withdraw_demo') {
-          if (Number(member.demo_balance) < txAmount) {
-            return jsonResponse({ error: 'User balance is lower than withdrawal request amount.' }, 400);
-          }
-          member.demo_balance = Number((Number(member.demo_balance) - txAmount).toFixed(2));
-          member.updated_at = nowIso;
         }
+      } else if (decision === 'rejected' && tx.type === 'withdraw_demo') {
+        member.demo_balance = Number((Number(member.demo_balance) + txAmount).toFixed(2));
+        member.updated_at = nowIso;
       }
 
       state.transactions[txIdx] = {
@@ -2539,6 +2676,23 @@ export default {
         processed_by: admin.uid,
         updated_at: nowIso,
       };
+      const title =
+        decision === 'approved'
+          ? tx.type === 'deposit_demo'
+            ? 'আপনার রিচার্জ সফল হয়েছে'
+            : 'আপনার উত্তোলন সফল হয়েছে'
+          : tx.type === 'deposit_demo'
+          ? 'আপনার রিচার্জ ব্যর্থ হয়েছে'
+          : 'আপনার উত্তোলন বাতিল ও ব্যালেন্স ফেরত দেওয়া হয়েছে';
+      state.notifications.unshift({
+        id: crypto.randomUUID(),
+        user_id: tx.user_id,
+        title,
+        message: `${title} (${txAmount} টাকা)।${adminNote ? ` নোট: ${adminNote}` : ''}`,
+        category: 'transaction',
+        is_read: false,
+        created_at: nowIso,
+      });
       await saveState(state);
       return jsonResponse({ ok: true, transaction: state.transactions[txIdx] });
     }

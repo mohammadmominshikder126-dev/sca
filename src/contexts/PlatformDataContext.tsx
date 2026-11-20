@@ -1,6 +1,5 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { getStoredAdminToken, getStoredServerToken, isSupabaseConfigured, supabase } from '../lib/supabase';
-import { getPreviewDeposits } from '../lib/localFallbackStore';
 import {
   AdminAuditLog,
   Announcement,
@@ -20,15 +19,8 @@ import {
 import {
   PREVIEW_ANNOUNCEMENTS,
   PREVIEW_BANNERS,
-  PREVIEW_BONUS_CODES,
-  PREVIEW_NOTIFICATIONS,
   PREVIEW_PLANS,
-  PREVIEW_REFERRALS,
   PREVIEW_SITE_SETTINGS,
-  PREVIEW_TICKETS,
-  PREVIEW_TRANSACTIONS,
-  PREVIEW_USER_PRODUCTS,
-  PREVIEW_USER_PROFILE,
 } from '../data/previewFallback';
 import { useAuth } from './AuthContext';
 
@@ -270,18 +262,15 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
           setUserTransactions(srvState.transactions || []);
           setUserProducts(srvState.userProducts || []);
           setUserReferrals(srvState.referrals || []);
-          setNotifications(
-            srvState.notifications && srvState.notifications.length > 0
-              ? srvState.notifications
-              : PREVIEW_NOTIFICATIONS
-          );
+          setNotifications(srvState.notifications || []);
         }
       } else if (!isAdminRoute) {
-        const previewTxs = getPreviewDeposits();
-        setNotifications(PREVIEW_NOTIFICATIONS);
-        setUserTransactions(previewTxs.length > 0 ? previewTxs : PREVIEW_TRANSACTIONS);
-        setUserProducts(PREVIEW_USER_PRODUCTS);
-        setUserReferrals(PREVIEW_REFERRALS);
+        setBankCard(null);
+        setUserTransactions([]);
+        setUserProducts([]);
+        setUserReferrals([]);
+        setUserTickets([]);
+        setNotifications([]);
       }
 
       if (authLoading) {
@@ -327,13 +316,6 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         } catch {
           // Preserve existing state on transient error
         }
-      } else if (!isAdminRoute && !isAdmin) {
-        setUserTickets(PREVIEW_TICKETS);
-        setAllProfiles([PREVIEW_USER_PROFILE]);
-        setAllTransactions(PREVIEW_TRANSACTIONS);
-        setAllBonusCodes(PREVIEW_BONUS_CODES);
-        setAllReferrals(PREVIEW_REFERRALS);
-        setAllTickets(PREVIEW_TICKETS);
       }
       setLoadingData(false);
       if (backendOnline) setRealtimeStatus('connected');
@@ -395,11 +377,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
             setUserTransactions(srvState.transactions || []);
             setUserProducts(srvState.userProducts || []);
             setUserReferrals(srvState.referrals || []);
-            setNotifications(
-              srvState.notifications && srvState.notifications.length > 0
-                ? srvState.notifications
-                : PREVIEW_NOTIFICATIONS
-            );
+            setNotifications(srvState.notifications || []);
           }
         } else {
           const { data: sessionData } = await supabase.auth.getSession();
@@ -421,13 +399,16 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
           if (!prodRes.error && prodRes.data) setUserProducts(prodRes.data as DemoUserProduct[]);
           else if (srvState?.userProducts) setUserProducts(srvState.userProducts);
 
-          if (!refRes.error && refRes.data) setUserReferrals(refRes.data as ReferralRecord[]);
-          if (!notifRes.error && notifRes.data && notifRes.data.length > 0) {
+          if (srvState?.referrals && srvState.referrals.length > 0) {
+            setUserReferrals(srvState.referrals);
+          } else if (!refRes.error && refRes.data) {
+            setUserReferrals(refRes.data as ReferralRecord[]);
+          }
+
+          if (!notifRes.error && notifRes.data) {
             setNotifications(notifRes.data as AppNotification[]);
-          } else if (srvState?.notifications && srvState.notifications.length > 0) {
+          } else if (srvState?.notifications) {
             setNotifications(srvState.notifications);
-          } else if (notifications.length === 0) {
-            setNotifications(PREVIEW_NOTIFICATIONS);
           }
           if (!readsRes.error && readsRes.data) setReadNotificationIds(readsRes.data.map((r) => r.notification_id));
           if (!ticketsRes.error && ticketsRes.data) setUserTickets(ticketsRes.data as SupportTicket[]);
@@ -436,7 +417,9 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         setBankCard(null);
         setUserTransactions([]);
         setUserProducts([]);
-        if (notifications.length === 0) setNotifications(PREVIEW_NOTIFICATIONS);
+        setUserReferrals([]);
+        setUserTickets([]);
+        setNotifications([]);
       }
 
       if (!authLoading && isAdmin) {
@@ -576,7 +559,14 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
       .on('postgres_changes', { event: '*', schema: 'public', table: 'announcements' }, () => void fetchPublicAndUser(true))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'banners' }, () => void fetchPublicAndUser(true))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications' }, () => void fetchPublicAndUser(true))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'demo_transactions' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'demo_transactions' }, () => {
+        void fetchPublicAndUser(true);
+        void refreshProfile();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'referral_records' }, () => {
+        void fetchPublicAndUser(true);
+        void refreshProfile();
+      })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'demo_user_products' }, () => void fetchPublicAndUser(true))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'support_tickets' }, () => void fetchPublicAndUser(true))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'bonus_codes' }, () => void fetchPublicAndUser(true))

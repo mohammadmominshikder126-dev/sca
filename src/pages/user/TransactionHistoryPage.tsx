@@ -1,6 +1,7 @@
 import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Navigate, useNavigate } from 'react-router-dom';
 import { ArrowDownLeft, ArrowLeft, ArrowUpRight, History, X } from 'lucide-react';
+import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
 import { formatDateTime } from '../../lib/supabase';
 import { DemoTransaction } from '../../types/database';
@@ -123,6 +124,19 @@ export const TransactionHistoryContent: React.FC = () => {
 
 export const TransactionHistoryPage: React.FC = () => {
   const navigate = useNavigate();
+  const { user, profile, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="min-h-[100dvh] bg-[#E9F1FC] flex items-center justify-center text-sm font-semibold text-[#061844]">
+        লোড হচ্ছে...
+      </div>
+    );
+  }
+
+  if (!user || !profile) {
+    return <Navigate to="/login" replace />;
+  }
 
   return (
     <div className="min-h-[100dvh] bg-[#E9F1FC] flex flex-col">

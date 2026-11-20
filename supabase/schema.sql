@@ -27,6 +27,18 @@ create table if not exists public.profiles (
   updated_at timestamptz not null default now()
 );
 
+alter table public.profiles add column if not exists scania_id text;
+alter table public.profiles add column if not exists email text default '';
+alter table public.profiles add column if not exists full_name text not null default 'Scania Demo Member';
+alter table public.profiles add column if not exists phone text default '';
+alter table public.profiles add column if not exists avatar_url text default '';
+alter table public.profiles add column if not exists tier text not null default 'Standard Demo';
+alter table public.profiles add column if not exists demo_balance numeric(14, 2) not null default 150.00;
+alter table public.profiles add column if not exists demo_bonus numeric(14, 2) not null default 150.00;
+alter table public.profiles add column if not exists referral_code text;
+alter table public.profiles add column if not exists referred_by uuid references public.profiles(id) on delete set null;
+alter table public.profiles add column if not exists is_active boolean not null default true;
+
 -- 2.2 User Roles (Server-checked RBAC; never editable by normal users)
 create table if not exists public.user_roles (
   user_id uuid primary key references auth.users(id) on delete cascade,
@@ -243,7 +255,7 @@ create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = public, extensions
 as $$
 declare
   v_ref_code text;
@@ -258,7 +270,7 @@ begin
   v_input_ref := nullif(trim(coalesce(new.raw_user_meta_data->>'referral_code', '')), '');
 
   if v_input_ref is not null then
-    select id into v_referrer_id from public.profiles where referral_code = v_input_ref limit 1;
+    select id into v_referrer_id from public.profiles where upper(referral_code) = upper(v_input_ref) limit 1;
   end if;
 
   insert into public.profiles (
@@ -273,7 +285,8 @@ begin
     v_referrer_id,
     150.00,
     150.00
-  );
+  )
+  on conflict (id) do nothing;
 
   insert into public.user_roles (user_id, role)
   values (new.id, 'user')
@@ -606,7 +619,76 @@ begin
 end;
 $$;
 
--- 4.3 Admin processes a Demo Deposit or Withdraw Request
+-- 4.3 User submits Deposit or Withdraw Request (deducts balance immediately on withdraw)
+create or replace function public.request_demo_transaction(
+  p_type text,
+  p_amount numeric,
+  p_method text,
+  p_reference_code text default ''
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_profile public.profiles%rowtype;
+  v_tx_id uuid;
+  v_amount numeric(14, 2) := round(p_amount, 2);
+  v_note text;
+begin
+  if v_uid is null then
+    raise exception 'Authentication required';
+  end if;
+
+  if p_type not in ('deposit_demo', 'withdraw_demo') then
+    raise exception 'Invalid transaction type';
+  end if;
+
+  if v_amount <= 0 or v_amount > 1000000 then
+    raise exception 'Invalid amount';
+  end if;
+
+  select * into v_profile from public.profiles where id = v_uid for update;
+  if not found or not v_profile.is_active then
+    raise exception 'Account is inactive or missing';
+  end if;
+
+  if p_type = 'withdraw_demo' then
+    if v_amount < 150 then
+      raise exception 'Minimum withdrawal is 150';
+    end if;
+    if v_profile.demo_balance < v_amount then
+      raise exception 'Insufficient balance';
+    end if;
+
+    update public.profiles
+    set demo_balance = demo_balance - v_amount,
+        updated_at = now()
+    where id = v_uid;
+
+    v_note := '5% চার্জ: ৳' || round(v_amount * 0.05, 2) || ' · প্রাপ্তি: ৳' || round(v_amount * 0.95, 2);
+  else
+    if v_amount < 500 then
+      raise exception 'Minimum deposit is 500';
+    end if;
+    v_note := 'আপনার পেমেন্টটি পর্যালোচনায় রয়েছে';
+  end if;
+
+  insert into public.demo_transactions (
+    user_id, type, amount, method, reference_code, status, admin_note
+  ) values (
+    v_uid, p_type, v_amount, coalesce(nullif(trim(p_method), ''), 'bKash'), coalesce(trim(p_reference_code), ''), 'pending', v_note
+  ) returning id into v_tx_id;
+
+  return jsonb_build_object('success', true, 'id', v_tx_id);
+end;
+$$;
+
+grant execute on function public.request_demo_transaction(text, numeric, text, text) to authenticated;
+
+-- 4.4 Admin processes a Deposit or Withdraw Request
 create or replace function public.admin_process_transaction(
   p_tx_id uuid,
   p_decision text,
@@ -638,48 +720,53 @@ begin
     raise exception 'Transaction already processed';
   end if;
 
-  if p_decision = 'approved' then
-    if v_tx.type = 'deposit_demo' then
-      update public.profiles
-      set demo_balance = demo_balance + v_tx.amount,
-          updated_at = now()
-      where id = v_tx.user_id;
+  if p_decision = 'approved' and v_tx.type = 'deposit_demo' then
+    update public.profiles
+    set demo_balance = demo_balance + v_tx.amount,
+        updated_at = now()
+    where id = v_tx.user_id;
 
-      -- Distribute 25% Level 1 Referral Commission upon deposit confirmation
-      declare
-        v_depositor public.profiles%rowtype;
-        v_comm numeric(14, 2);
-      begin
-        select * into v_depositor from public.profiles where id = v_tx.user_id;
-        if v_depositor.referred_by is not null then
-          v_comm := round(v_tx.amount * 0.25, 2);
-          if v_comm > 0 then
-            update public.profiles
-            set demo_balance = demo_balance + v_comm,
-                updated_at = now()
-            where id = v_depositor.referred_by;
+    -- Distribute 25% Level 1 Referral Commission upon deposit confirmation
+    declare
+      v_depositor public.profiles%rowtype;
+      v_comm numeric(14, 2);
+    begin
+      select * into v_depositor from public.profiles where id = v_tx.user_id;
+      if v_depositor.referred_by is not null then
+        v_comm := round(v_tx.amount * 0.25, 2);
+        if v_comm > 0 then
+          update public.profiles
+          set demo_balance = demo_balance + v_comm,
+              updated_at = now()
+          where id = v_depositor.referred_by;
 
-            update public.referral_records
-            set simulated_commission = simulated_commission + v_comm
-            where referrer_id = v_depositor.referred_by and referred_user_id = v_tx.user_id and level = 1;
+          insert into public.referral_records (referrer_id, referred_user_id, level, commission_rate, simulated_commission)
+          values (v_depositor.referred_by, v_tx.user_id, 1, 25.00, v_comm)
+          on conflict (referrer_id, referred_user_id) do update
+          set simulated_commission = referral_records.simulated_commission + v_comm;
 
-            insert into public.demo_transactions (
-              user_id, type, amount, method, reference_code, status, admin_note
-            ) values (
-              v_depositor.referred_by, 'referral_commission', v_comm, 'Level 1 Referral (25%)', v_depositor.scania_id, 'completed', 'Deposit confirmation commission'
-            );
-          end if;
+          insert into public.demo_transactions (
+            user_id, type, amount, method, reference_code, status, admin_note
+          ) values (
+            v_depositor.referred_by, 'referral_commission', v_comm, 'লেভেল 1 রেফারেল (25%)', v_depositor.scania_id, 'completed', v_depositor.full_name || ' এর রিচার্জ থেকে 25% কমিশন'
+          );
+
+          insert into public.notifications (user_id, title, message, category)
+          values (
+            v_depositor.referred_by,
+            'টিম কমিশন যুক্ত হয়েছে (25%)',
+            v_depositor.full_name || ' এর ' || v_tx.amount || ' টাকা রিচার্জ কনফার্ম হওয়ায় ' || v_comm || ' টাকা কমিশন আপনার ব্যালেন্সে যোগ হয়েছে।',
+            'bonus'
+          );
         end if;
-      end;
-    elsif v_tx.type = 'withdraw_demo' then
-      update public.profiles
-      set demo_balance = demo_balance - v_tx.amount,
-          updated_at = now()
-      where id = v_tx.user_id and demo_balance >= v_tx.amount;
-      if not found then
-        raise exception 'User has insufficient demo balance for this withdrawal';
       end if;
-    end if;
+    end;
+  elsif p_decision = 'rejected' and v_tx.type = 'withdraw_demo' then
+    -- Refund deducted withdrawal amount when rejected
+    update public.profiles
+    set demo_balance = demo_balance + v_tx.amount,
+        updated_at = now()
+    where id = v_tx.user_id;
   end if;
 
   update public.demo_transactions
@@ -692,8 +779,14 @@ begin
   insert into public.notifications (user_id, title, message, category)
   values (
     v_tx.user_id,
-    'Demo Request ' || initcap(p_decision),
-    'Your simulated ' || replace(v_tx.type, '_demo', '') || ' request of ' || v_tx.amount || ' was ' || p_decision || '.',
+    case
+      when p_decision = 'approved' and v_tx.type = 'deposit_demo' then 'আপনার রিচার্জ সফল হয়েছে'
+      when p_decision = 'approved' and v_tx.type = 'withdraw_demo' then 'আপনার উত্তোলন সফল হয়েছে'
+      when p_decision = 'rejected' and v_tx.type = 'deposit_demo' then 'আপনার রিচার্জ ব্যর্থ হয়েছে'
+      else 'আপনার উত্তোলন বাতিল ও ব্যালেন্স ফেরত দেওয়া হয়েছে'
+    end,
+    v_tx.amount || ' টাকা (' || replace(v_tx.type, '_demo', '') || ') ' || p_decision || '.' ||
+      case when coalesce(p_admin_note, '') <> '' then ' নোট: ' || p_admin_note else '' end,
     'transaction'
   );
 
@@ -887,6 +980,7 @@ begin
     public.notifications,
     public.demo_transactions,
     public.demo_user_products,
+    public.referral_records,
     public.support_tickets,
     public.support_messages,
     public.profiles,
