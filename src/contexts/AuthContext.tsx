@@ -92,13 +92,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const loadUserDetails = useCallback(async (uid: string) => {
     if (!supabase) return;
-    const [{ data: prof }, { data: roleRow }] = await Promise.all([
+    const [{ data: prof }, { data: roleRow, error: roleErr }] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', uid).maybeSingle(),
       supabase.from('user_roles').select('role').eq('user_id', uid).maybeSingle(),
     ]);
 
     if (prof) setProfile(prof as Profile);
-    setRole((roleRow?.role as AppRole) || 'user');
+    if (!roleErr) {
+      setRole((roleRow?.role as AppRole) || 'user');
+    }
   }, []);
 
   const applyServerAuthSession = useCallback((srvProfile: Profile, token?: string, nextRole: AppRole = 'user') => {
@@ -108,6 +110,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       } else {
         setStoredServerToken(token);
       }
+    }
+    if (nextRole === 'admin' || nextRole === 'super_admin') {
+      setSession(null);
     }
     if (nextRole === 'user') {
       localSaveCachedProfile(srvProfile);
@@ -125,10 +130,25 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const refreshProfile = useCallback(async () => {
+    const onAdminRoute =
+      typeof window !== 'undefined' && window.location.pathname.startsWith('/admin');
+    const adminToken = typeof window !== 'undefined' ? getStoredAdminToken() : null;
+    const isCurrentAdmin = role === 'admin' || role === 'super_admin';
+
+    // Never overwrite an active Admin Token session with a background User refresh
+    if (adminToken && (onAdminRoute || isCurrentAdmin)) {
+      return;
+    }
+
     if (session?.user?.id && supabase) {
       await loadUserDetails(session.user.id);
       return;
     }
+
+    if (isCurrentAdmin || onAdminRoute) {
+      return;
+    }
+
     if (typeof window !== 'undefined') {
       const token = getStoredServerToken();
       if (token) {
@@ -150,7 +170,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
     }
-  }, [session?.user?.id, loadUserDetails, applyServerAuthSession]);
+  }, [role, session?.user?.id, loadUserDetails, applyServerAuthSession]);
 
   useEffect(() => {
     let mounted = true;
@@ -232,17 +252,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return;
       }
 
-      const { data } = await supabase.auth.getSession();
-      if (!mounted) return;
-
-      if (data.session?.user) {
-        setSession(data.session);
-        setUser(data.session.user);
-        await loadUserDetails(data.session.user.id);
-        if (mounted) setLoading(false);
-      } else if (typeof window !== 'undefined') {
+      // Prioritize stored Admin Token when on /admin routes before checking user sessions
+      if (typeof window !== 'undefined' && window.location.pathname.startsWith('/admin')) {
         const adminToken = getStoredAdminToken();
-        if (adminToken && window.location.pathname.startsWith('/admin')) {
+        if (adminToken) {
           let adminRestored = false;
           try {
             const adminRes = await fetch('/api/admin/state', {
@@ -287,7 +300,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             return;
           }
         }
+      }
 
+      const { data } = await supabase.auth.getSession();
+      if (!mounted) return;
+
+      if (data.session?.user) {
+        setSession(data.session);
+        setUser(data.session.user);
+        await loadUserDetails(data.session.user.id);
+        if (mounted) setLoading(false);
+      } else if (typeof window !== 'undefined') {
         const token = getStoredServerToken();
         if (token) {
           try {
@@ -312,6 +335,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       const { data: sub } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
         if (!mounted) return;
+        const onAdminWithToken =
+          typeof window !== 'undefined' &&
+          window.location.pathname.startsWith('/admin') &&
+          Boolean(getStoredAdminToken());
+
+        if (onAdminWithToken) {
+          setLoading(false);
+          return;
+        }
+
         if (newSession?.user) {
           setStoredServerToken(null);
           setSession(newSession);
@@ -612,7 +645,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (res.ok) {
         const data = (await res.json()) as { token?: string; profile?: Profile; role?: AppRole };
         if (data.profile && data.token) {
+          setStoredServerToken(null);
           applyServerAuthSession(data.profile, data.token, data.role || 'super_admin');
+          if (supabase) {
+            try {
+              const { data: cur } = await supabase.auth.getSession();
+              if (cur.session?.user) {
+                await supabase.auth.signOut();
+              }
+            } catch {
+              // Ignore cleanup errors
+            }
+          }
           return {};
         }
       }
@@ -643,6 +687,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return { error: 'Access denied. This account does not have Administrator privileges in user_roles.' };
     }
 
+    setStoredServerToken(null);
+    setStoredAdminToken(null);
+    setSession(data.session ?? null);
+    setUser(data.user);
     await loadUserDetails(data.user.id);
     return {};
   };
