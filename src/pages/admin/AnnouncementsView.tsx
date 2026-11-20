@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { Edit3, Globe, Megaphone, Plus, Trash2, X } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { callApiWithFallback, formatDateTime, supabase } from '../../lib/supabase';
+import { callApiWithFallback, formatDateTime, getStoredAdminToken, supabase } from '../../lib/supabase';
 import { Announcement } from '../../types/database';
 import { ConfirmModal, EmptyState, useToast } from '../../components/ui/Feedback';
 
@@ -16,8 +16,7 @@ export const AnnouncementsView: React.FC = () => {
   const [saving, setSaving] = useState(false);
 
   const hasAdminAccess = () => {
-    const hasAdminToken =
-      typeof window !== 'undefined' && Boolean(window.sessionStorage.getItem('scania_admin_token'));
+    const hasAdminToken = Boolean(getStoredAdminToken());
     return hasAdminToken || (!isPreviewMode && Boolean(supabase && user));
   };
 

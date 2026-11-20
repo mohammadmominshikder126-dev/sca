@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Save } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { supabase } from '../../lib/supabase';
+import { getStoredAdminToken, supabase } from '../../lib/supabase';
 import { SiteSettings } from '../../types/database';
 import { useToast } from '../../components/ui/Feedback';
 
@@ -40,8 +40,7 @@ export const SiteSettingsView: React.FC = () => {
         updated_at: new Date().toISOString(),
       };
 
-      const adminToken =
-        typeof window !== 'undefined' ? window.sessionStorage.getItem('scania_admin_token') : null;
+      const adminToken = getStoredAdminToken();
 
       if (!isPreviewMode && supabase && user && !adminToken) {
         const { error } = await supabase.from('site_settings').update(payload).eq('id', 1);

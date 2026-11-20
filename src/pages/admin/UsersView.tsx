@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { callApiWithFallback, formatCurrency, formatDateTime, formatShortDate, supabase } from '../../lib/supabase';
+import { callApiWithFallback, formatCurrency, formatDateTime, formatShortDate, getStoredAdminToken, supabase } from '../../lib/supabase';
 import { Profile } from '../../types/database';
 import { EmptyState, useToast } from '../../components/ui/Feedback';
 
@@ -54,8 +54,7 @@ export const UsersView: React.FC = () => {
   const [saving, setSaving] = useState(false);
 
   const hasAdminAccess = () => {
-    const hasAdminToken =
-      typeof window !== 'undefined' && Boolean(window.sessionStorage.getItem('scania_admin_token'));
+    const hasAdminToken = Boolean(getStoredAdminToken());
     return hasAdminToken || (!isPreviewMode && Boolean(supabase && user));
   };
 

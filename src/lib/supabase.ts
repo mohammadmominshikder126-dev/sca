@@ -1,9 +1,29 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
-const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
+export function cleanEnvValue(raw: string | undefined, names: string[]): string {
+  let val = (raw || '').trim();
+  if (!val) return '';
+  for (const name of names) {
+    if (val.startsWith(`${name}=`)) {
+      val = val.slice(name.length + 1).trim();
+      break;
+    }
+  }
+  if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith('"') && val.endsWith('"'))) {
+    val = val.slice(1, -1).trim();
+  }
+  if (val.startsWith("'") || val.startsWith('"')) val = val.slice(1).trim();
+  if (val.endsWith("'") || val.endsWith('"')) val = val.slice(0, -1).trim();
+  return val;
+}
 
-function isValidSupabaseUrl(value: string): boolean {
+let supabaseUrl = cleanEnvValue(import.meta.env.VITE_SUPABASE_URL, ['VITE_SUPABASE_URL', 'SUPABASE_URL']);
+let supabaseAnonKey = cleanEnvValue(import.meta.env.VITE_SUPABASE_ANON_KEY, [
+  'VITE_SUPABASE_ANON_KEY',
+  'SUPABASE_ANON_KEY',
+]);
+
+export function isValidSupabaseUrl(value: string): boolean {
   if (!value || value.includes('your-project-id')) return false;
   try {
     const parsed = new URL(value);
@@ -13,26 +33,63 @@ function isValidSupabaseUrl(value: string): boolean {
   }
 }
 
-export const isSupabaseConfigured = Boolean(
-  isValidSupabaseUrl(supabaseUrl) &&
-    supabaseAnonKey &&
-    !supabaseAnonKey.includes('your-supabase-anon-key')
-);
+function checkConfigured(url: string, key: string): boolean {
+  return Boolean(
+    isValidSupabaseUrl(url) &&
+      key &&
+      !key.includes('your-supabase-anon-key')
+  );
+}
 
-export const supabase: SupabaseClient | null = isSupabaseConfigured
-  ? createClient(supabaseUrl, supabaseAnonKey, {
-      auth: {
-        persistSession: true,
-        autoRefreshToken: true,
-        detectSessionInUrl: true,
+function makeSupabaseClient(url: string, key: string): SupabaseClient | null {
+  if (!checkConfigured(url, key)) return null;
+  return createClient(url, key, {
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
+    },
+    realtime: {
+      params: {
+        eventsPerSecond: 10,
       },
-      realtime: {
-        params: {
-          eventsPerSecond: 10,
-        },
-      },
-    })
-  : null;
+    },
+  });
+}
+
+export let isSupabaseConfigured = checkConfigured(supabaseUrl, supabaseAnonKey);
+export let supabase: SupabaseClient | null = makeSupabaseClient(supabaseUrl, supabaseAnonKey);
+
+let hydrationPromise: Promise<boolean> | null = null;
+
+export async function hydrateRuntimeSupabaseConfig(): Promise<boolean> {
+  if (isSupabaseConfigured && supabase) return true;
+  if (typeof window === 'undefined') return false;
+  if (hydrationPromise) return hydrationPromise;
+
+  hydrationPromise = (async () => {
+    try {
+      const res = await fetch('/api/public/config', { cache: 'no-store' });
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) return false;
+      const cfg = (await res.json()) as { supabaseUrl?: string; supabaseAnonKey?: string };
+      const cleanUrl = cleanEnvValue(cfg.supabaseUrl, ['VITE_SUPABASE_URL', 'SUPABASE_URL']);
+      const cleanKey = cleanEnvValue(cfg.supabaseAnonKey, ['VITE_SUPABASE_ANON_KEY', 'SUPABASE_ANON_KEY']);
+      if (checkConfigured(cleanUrl, cleanKey)) {
+        supabaseUrl = cleanUrl;
+        supabaseAnonKey = cleanKey;
+        supabase = makeSupabaseClient(cleanUrl, cleanKey);
+        isSupabaseConfigured = Boolean(supabase);
+        return isSupabaseConfigured;
+      }
+    } catch {
+      // Ignore if backend config endpoint unreachable
+    }
+    return false;
+  })();
+
+  return hydrationPromise;
+}
 
 export function formatCurrency(amount: number, symbol = '৳'): string {
   const num = Number(amount || 0);

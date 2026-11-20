@@ -2,10 +2,44 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
-import {defineConfig} from 'vite';
+import {defineConfig, loadEnv} from 'vite';
 
-export default defineConfig(() => {
+function cleanEnvValue(raw: string | undefined, names: string[]): string {
+  let val = (raw || '').trim();
+  if (!val) return '';
+  for (const name of names) {
+    if (val.startsWith(`${name}=`)) {
+      val = val.slice(name.length + 1).trim();
+      break;
+    }
+  }
+  if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith('"') && val.endsWith('"'))) {
+    val = val.slice(1, -1).trim();
+  }
+  if (val.startsWith("'") || val.startsWith('"')) val = val.slice(1).trim();
+  if (val.endsWith("'") || val.endsWith('"')) val = val.slice(0, -1).trim();
+  return val;
+}
+
+export default defineConfig(({mode}) => {
+  const fileEnv = loadEnv(mode, process.cwd(), '');
+  const cleanSupabaseUrl = cleanEnvValue(
+    process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || fileEnv.VITE_SUPABASE_URL || fileEnv.SUPABASE_URL,
+    ['VITE_SUPABASE_URL', 'SUPABASE_URL']
+  );
+  const cleanSupabaseAnonKey = cleanEnvValue(
+    process.env.VITE_SUPABASE_ANON_KEY ||
+      process.env.SUPABASE_ANON_KEY ||
+      fileEnv.VITE_SUPABASE_ANON_KEY ||
+      fileEnv.SUPABASE_ANON_KEY,
+    ['VITE_SUPABASE_ANON_KEY', 'SUPABASE_ANON_KEY']
+  );
+
   return {
+    define: {
+      'import.meta.env.VITE_SUPABASE_URL': JSON.stringify(cleanSupabaseUrl),
+      'import.meta.env.VITE_SUPABASE_ANON_KEY': JSON.stringify(cleanSupabaseAnonKey),
+    },
     plugins: [
       react(),
       tailwindcss(),

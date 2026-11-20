@@ -3,7 +3,7 @@ import { Edit3, Plus, Power, Trash2, X } from 'lucide-react';
 import { PlanFallbackThumbnail } from '../../components/ScaniaVisuals';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { callApiWithFallback, formatCurrency, supabase } from '../../lib/supabase';
+import { callApiWithFallback, formatCurrency, getStoredAdminToken, supabase } from '../../lib/supabase';
 import { DemoPlan } from '../../types/database';
 import { ConfirmModal, EmptyState, useToast } from '../../components/ui/Feedback';
 
@@ -17,8 +17,7 @@ export const PlansManagerView: React.FC = () => {
   const [saving, setSaving] = useState(false);
 
   const hasAdminAccess = () => {
-    const hasAdminToken =
-      typeof window !== 'undefined' && Boolean(window.sessionStorage.getItem('scania_admin_token'));
+    const hasAdminToken = Boolean(getStoredAdminToken());
     return hasAdminToken || (!isPreviewMode && Boolean(supabase && user));
   };
 

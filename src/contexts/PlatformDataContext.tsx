@@ -92,7 +92,7 @@ const PlatformDataContext = createContext<PlatformDataContextValue>({
 export const usePlatformData = () => useContext(PlatformDataContext);
 
 export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { user, isAdmin, isPreviewMode, refreshProfile } = useAuth();
+  const { user, isAdmin, isPreviewMode, loading: authLoading, refreshProfile } = useAuth();
 
   const [siteSettings, setSiteSettings] = useState<SiteSettings>(PREVIEW_SITE_SETTINGS);
   const [plans, setPlans] = useState<DemoPlan[]>([]);
@@ -126,6 +126,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
     try {
       const res = await fetch('/api/user/state', {
         headers: { Authorization: `Bearer ${token}` },
+        cache: 'no-store',
       });
       if (!res.ok) return null;
       return (await res.json()) as {
@@ -140,19 +141,107 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
     }
   }, []);
 
+  const fetchAdminDirectlyFromSupabase = useCallback(async () => {
+    if (!supabase) return false;
+    try {
+      const [profRes, allTxRes, allProdRes, bonusRes, allRefRes, allTicketsRes, logsRes] = await Promise.all([
+        supabase.from('profiles').select('*').order('created_at', { ascending: false }),
+        supabase.from('demo_transactions').select('*').order('created_at', { ascending: false }),
+        supabase.from('demo_user_products').select('*').order('started_at', { ascending: false }),
+        supabase.from('bonus_codes').select('*').order('created_at', { ascending: false }),
+        supabase.from('referral_records').select('*').order('created_at', { ascending: false }),
+        supabase.from('support_tickets').select('*').order('updated_at', { ascending: false }),
+        supabase.from('admin_audit_logs').select('*').order('created_at', { ascending: false }).limit(50),
+      ]);
+
+      const profList = (!profRes.error && profRes.data ? (profRes.data as Profile[]) : []) || [];
+      const profMap = new Map(profList.map((p) => [p.id, p]));
+
+      if (!profRes.error && profRes.data) {
+        setAllProfiles(profList);
+      }
+
+      if (!allTxRes.error && allTxRes.data) {
+        const joinedTx = (allTxRes.data as DemoTransaction[]).map((tx) => {
+          const p = profMap.get(tx.user_id);
+          return p
+            ? { ...tx, profiles: { full_name: p.full_name, scania_id: p.scania_id, email: p.email } }
+            : tx;
+        });
+        setAllTransactions(joinedTx);
+      }
+
+      if (!allProdRes.error && allProdRes.data) {
+        setAllUserProducts(allProdRes.data as DemoUserProduct[]);
+      }
+
+      if (!bonusRes.error && bonusRes.data) {
+        setAllBonusCodes(bonusRes.data as BonusCode[]);
+      }
+
+      if (!allRefRes.error && allRefRes.data) {
+        const joinedRefs = (allRefRes.data as ReferralRecord[]).map((ref) => {
+          const referred = profMap.get(ref.referred_user_id);
+          const referrer = profMap.get(ref.referrer_id);
+          return {
+            ...ref,
+            referred: referred
+              ? {
+                  id: referred.id,
+                  full_name: referred.full_name,
+                  scania_id: referred.scania_id,
+                  email: referred.email,
+                  tier: referred.tier,
+                  created_at: referred.created_at,
+                }
+              : undefined,
+            referrer: referrer
+              ? {
+                  id: referrer.id,
+                  full_name: referrer.full_name,
+                  scania_id: referrer.scania_id,
+                }
+              : undefined,
+          };
+        });
+        setAllReferrals(joinedRefs);
+      }
+
+      if (!allTicketsRes.error && allTicketsRes.data) {
+        const joinedTickets = (allTicketsRes.data as SupportTicket[]).map((tk) => {
+          const p = profMap.get(tk.user_id);
+          return p
+            ? { ...tk, profiles: { full_name: p.full_name, scania_id: p.scania_id, email: p.email } }
+            : tk;
+        });
+        setAllTickets(joinedTickets);
+      }
+
+      if (!logsRes.error && logsRes.data) {
+        setAuditLogs(logsRes.data as AdminAuditLog[]);
+      }
+
+      return !profRes.error || !allTxRes.error;
+    } catch {
+      return false;
+    }
+  }, []);
+
   const fetchPublicAndUser = useCallback(async (silent = false) => {
-    // 1. Always check Express server-synced site settings / plans / announcements / banners
+    // 1. Always check backend-synced site settings / plans / announcements / banners
     let serverPublic: {
       siteSettings?: SiteSettings | null;
       announcements?: Announcement[] | null;
       plans?: DemoPlan[] | null;
       banners?: Banner[] | null;
     } = {};
+    let backendOnline = false;
     try {
       const pubRes = await fetch('/api/public/site-data', { cache: 'no-store' });
       const pubType = pubRes.headers.get('content-type') || '';
       if (pubRes.ok && pubType.includes('application/json')) {
         serverPublic = (await pubRes.json()) as typeof serverPublic;
+        backendOnline = true;
       }
     } catch {
       // Ignore if static host
@@ -160,6 +249,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
 
     const serverToken = getStoredServerToken();
     const adminToken = getStoredAdminToken();
+    const isAdminRoute = typeof window !== 'undefined' && window.location.pathname.startsWith('/admin');
 
     if (!isSupabaseConfigured || !supabase) {
       setSiteSettings(serverPublic.siteSettings || PREVIEW_SITE_SETTINGS);
@@ -186,12 +276,17 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
               : PREVIEW_NOTIFICATIONS
           );
         }
-      } else {
+      } else if (!isAdminRoute) {
         const previewTxs = getPreviewDeposits();
         setNotifications(PREVIEW_NOTIFICATIONS);
         setUserTransactions(previewTxs.length > 0 ? previewTxs : PREVIEW_TRANSACTIONS);
         setUserProducts(PREVIEW_USER_PRODUCTS);
         setUserReferrals(PREVIEW_REFERRALS);
+      }
+
+      if (authLoading) {
+        if (!silent) setLoadingData(false);
+        return;
       }
 
       if (isAdmin && adminToken) {
@@ -212,22 +307,27 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
               announcements?: Announcement[];
               banners?: Banner[];
               siteSettings?: SiteSettings | null;
+              supportTickets?: SupportTicket[];
+              auditLogs?: AdminAuditLog[];
             };
-            if (adminData.profiles) setAllProfiles(adminData.profiles);
-            if (adminData.transactions) setAllTransactions(adminData.transactions);
-            if (adminData.referrals) setAllReferrals(adminData.referrals);
-            if (adminData.userProducts) setAllUserProducts(adminData.userProducts);
+            if (Array.isArray(adminData.profiles)) setAllProfiles(adminData.profiles);
+            if (Array.isArray(adminData.transactions)) setAllTransactions(adminData.transactions);
+            if (Array.isArray(adminData.referrals)) setAllReferrals(adminData.referrals);
+            if (Array.isArray(adminData.userProducts)) setAllUserProducts(adminData.userProducts);
             if (adminData.bankCards) setAllBankCards(adminData.bankCards);
-            if (adminData.bonusCodes) setAllBonusCodes(adminData.bonusCodes);
+            if (Array.isArray(adminData.bonusCodes)) setAllBonusCodes(adminData.bonusCodes);
             if (adminData.plans && adminData.plans.length > 0) setPlans(adminData.plans);
             if (adminData.announcements) setAnnouncements(adminData.announcements);
             if (adminData.banners) setBanners(adminData.banners);
             if (adminData.siteSettings) setSiteSettings(adminData.siteSettings);
+            if (Array.isArray(adminData.supportTickets)) setAllTickets(adminData.supportTickets);
+            if (Array.isArray(adminData.auditLogs)) setAuditLogs(adminData.auditLogs);
+            setRealtimeStatus('connected');
           }
         } catch {
-          // Ignore
+          // Preserve existing state on transient error
         }
-      } else {
+      } else if (!isAdminRoute && !isAdmin) {
         setUserTickets(PREVIEW_TICKETS);
         setAllProfiles([PREVIEW_USER_PROFILE]);
         setAllTransactions(PREVIEW_TRANSACTIONS);
@@ -236,7 +336,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         setAllTickets(PREVIEW_TICKETS);
       }
       setLoadingData(false);
-      setRealtimeStatus('connected');
+      if (backendOnline) setRealtimeStatus('connected');
       return;
     }
 
@@ -249,7 +349,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         supabase.from('banners').select('*').order('sort_order', { ascending: true }).order('created_at', { ascending: false }),
       ]);
 
-      const dbSettings = settingsRes.data as SiteSettings | null;
+      const dbSettings = !settingsRes.error ? (settingsRes.data as SiteSettings | null) : null;
       const srvSettings = serverPublic.siteSettings || null;
       if (dbSettings && srvSettings) {
         setSiteSettings(
@@ -257,31 +357,37 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
             ? srvSettings
             : dbSettings
         );
-      } else {
+      } else if (srvSettings || dbSettings) {
         setSiteSettings(srvSettings || dbSettings || PREVIEW_SITE_SETTINGS);
       }
 
-      setPlans(
-        plansRes.data && plansRes.data.length > 0
-          ? (plansRes.data as DemoPlan[])
-          : serverPublic.plans && serverPublic.plans.length > 0
-          ? serverPublic.plans
-          : PREVIEW_PLANS
-      );
-      setAnnouncements(
-        annRes.data && annRes.data.length > 0
-          ? (annRes.data as Announcement[])
-          : serverPublic.announcements && serverPublic.announcements.length > 0
-          ? serverPublic.announcements
-          : PREVIEW_ANNOUNCEMENTS
-      );
-      if (bannersRes.data && bannersRes.data.length > 0) {
+      if (!plansRes.error && plansRes.data && plansRes.data.length > 0) {
+        setPlans(plansRes.data as DemoPlan[]);
+      } else if (serverPublic.plans && serverPublic.plans.length > 0) {
+        setPlans(serverPublic.plans);
+      } else if (plans.length === 0) {
+        setPlans(PREVIEW_PLANS);
+      }
+
+      if (!annRes.error && annRes.data && annRes.data.length > 0) {
+        setAnnouncements(annRes.data as Announcement[]);
+      } else if (serverPublic.announcements && serverPublic.announcements.length > 0) {
+        setAnnouncements(serverPublic.announcements);
+      } else if (announcements.length === 0) {
+        setAnnouncements(PREVIEW_ANNOUNCEMENTS);
+      }
+
+      if (!bannersRes.error && bannersRes.data && bannersRes.data.length > 0) {
         setBanners(bannersRes.data as Banner[]);
-      } else if (serverPublic.banners) {
+      } else if (serverPublic.banners && serverPublic.banners.length > 0) {
         setBanners(serverPublic.banners);
       }
 
-      if (user?.id) {
+      if (!settingsRes.error || !plansRes.error || backendOnline) {
+        setRealtimeStatus('connected');
+      }
+
+      if (user?.id && !isAdmin) {
         if (serverToken) {
           const srvState = await fetchServerUserState(serverToken);
           if (srvState) {
@@ -301,11 +407,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
           const [txRes, prodRes, refRes, notifRes, readsRes, ticketsRes, srvState] = await Promise.all([
             supabase.from('demo_transactions').select('*').eq('user_id', user.id).order('created_at', { ascending: false }),
             supabase.from('demo_user_products').select('*').eq('user_id', user.id).order('started_at', { ascending: false }),
-            supabase
-              .from('referral_records')
-              .select('*, referred:profiles!referral_records_referred_user_id_fkey(id, full_name, scania_id, email, tier, created_at)')
-              .eq('referrer_id', user.id)
-              .order('created_at', { ascending: false }),
+            supabase.from('referral_records').select('*').eq('referrer_id', user.id).order('created_at', { ascending: false }),
             supabase.from('notifications').select('*').or(`user_id.eq.${user.id},user_id.is.null`).order('created_at', { ascending: false }),
             supabase.from('notification_reads').select('notification_id').eq('user_id', user.id),
             supabase.from('support_tickets').select('*').eq('user_id', user.id).order('updated_at', { ascending: false }),
@@ -313,41 +415,45 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
           ]);
 
           setBankCard(srvState?.bankCard || null);
-          if (txRes.data) setUserTransactions(txRes.data as DemoTransaction[]);
+          if (!txRes.error && txRes.data) setUserTransactions(txRes.data as DemoTransaction[]);
           else if (srvState?.transactions) setUserTransactions(srvState.transactions);
 
-          if (prodRes.data) setUserProducts(prodRes.data as DemoUserProduct[]);
+          if (!prodRes.error && prodRes.data) setUserProducts(prodRes.data as DemoUserProduct[]);
           else if (srvState?.userProducts) setUserProducts(srvState.userProducts);
 
-          if (refRes.data) setUserReferrals(refRes.data as unknown as ReferralRecord[]);
-          if (notifRes.data && notifRes.data.length > 0) {
+          if (!refRes.error && refRes.data) setUserReferrals(refRes.data as ReferralRecord[]);
+          if (!notifRes.error && notifRes.data && notifRes.data.length > 0) {
             setNotifications(notifRes.data as AppNotification[]);
           } else if (srvState?.notifications && srvState.notifications.length > 0) {
             setNotifications(srvState.notifications);
-          } else {
+          } else if (notifications.length === 0) {
             setNotifications(PREVIEW_NOTIFICATIONS);
           }
-          if (readsRes.data) setReadNotificationIds(readsRes.data.map((r) => r.notification_id));
-          if (ticketsRes.data) setUserTickets(ticketsRes.data as SupportTicket[]);
+          if (!readsRes.error && readsRes.data) setReadNotificationIds(readsRes.data.map((r) => r.notification_id));
+          if (!ticketsRes.error && ticketsRes.data) setUserTickets(ticketsRes.data as SupportTicket[]);
         }
-      } else {
+      } else if (!user?.id && !isAdminRoute) {
         setBankCard(null);
         setUserTransactions([]);
         setUserProducts([]);
-        setNotifications(PREVIEW_NOTIFICATIONS);
+        if (notifications.length === 0) setNotifications(PREVIEW_NOTIFICATIONS);
       }
 
-      if (isAdmin) {
-        const adminToken = getStoredAdminToken();
+      if (!authLoading && isAdmin) {
+        const { data: sessionData } = await supabase.auth.getSession();
+        const effectiveAdminToken = adminToken || sessionData.session?.access_token;
+        let fetchedViaAdminApi = false;
 
-        if (adminToken) {
+        if (effectiveAdminToken) {
           try {
             const adminRes = await fetch('/api/admin/state', {
-              headers: { Authorization: `Bearer ${adminToken}` },
+              headers: { Authorization: `Bearer ${effectiveAdminToken}` },
               cache: 'no-store',
             });
             if (adminRes.ok) {
               const adminData = (await adminRes.json()) as {
+                mode?: string;
+                schemaReady?: boolean;
                 profiles?: Profile[];
                 transactions?: DemoTransaction[];
                 referrals?: ReferralRecord[];
@@ -358,59 +464,60 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
                 announcements?: Announcement[];
                 banners?: Banner[];
                 siteSettings?: SiteSettings | null;
+                supportTickets?: SupportTicket[];
+                auditLogs?: AdminAuditLog[];
               };
-              if (adminData.profiles) setAllProfiles(adminData.profiles);
-              if (adminData.transactions) setAllTransactions(adminData.transactions);
-              if (adminData.referrals) setAllReferrals(adminData.referrals);
-              if (adminData.userProducts) setAllUserProducts(adminData.userProducts);
-              if (adminData.bankCards) setAllBankCards(adminData.bankCards);
-              if (adminData.bonusCodes) setAllBonusCodes(adminData.bonusCodes);
-              if (adminData.plans && adminData.plans.length > 0) setPlans(adminData.plans);
-              if (adminData.announcements) setAnnouncements(adminData.announcements);
-              if (adminData.banners) setBanners(adminData.banners);
-              if (adminData.siteSettings) setSiteSettings(adminData.siteSettings);
+              const hasLivePayload =
+                adminData.mode === 'supabase' ||
+                adminData.schemaReady === true ||
+                (Array.isArray(adminData.profiles) && adminData.profiles.length > 0) ||
+                (Array.isArray(adminData.transactions) && adminData.transactions.length > 0);
+
+              if (hasLivePayload) {
+                if (Array.isArray(adminData.profiles)) setAllProfiles(adminData.profiles);
+                if (Array.isArray(adminData.transactions)) setAllTransactions(adminData.transactions);
+                if (Array.isArray(adminData.referrals)) setAllReferrals(adminData.referrals);
+                if (Array.isArray(adminData.userProducts)) setAllUserProducts(adminData.userProducts);
+                if (adminData.bankCards) setAllBankCards(adminData.bankCards);
+                if (Array.isArray(adminData.bonusCodes)) setAllBonusCodes(adminData.bonusCodes);
+                if (adminData.plans && adminData.plans.length > 0) setPlans(adminData.plans);
+                if (adminData.announcements) setAnnouncements(adminData.announcements);
+                if (adminData.banners) setBanners(adminData.banners);
+                if (adminData.siteSettings) setSiteSettings(adminData.siteSettings);
+                if (Array.isArray(adminData.supportTickets)) setAllTickets(adminData.supportTickets);
+                if (Array.isArray(adminData.auditLogs)) setAuditLogs(adminData.auditLogs);
+                fetchedViaAdminApi = true;
+                setRealtimeStatus('connected');
+              }
             }
           } catch {
-            // Ignore network error
+            // Fall through to direct Supabase query fallback
           }
-        } else {
-          const [profRes, allTxRes, allProdRes, bonusRes, allRefRes, allTicketsRes, logsRes] = await Promise.all([
-            supabase.from('profiles').select('*').order('created_at', { ascending: false }),
-            supabase
-              .from('demo_transactions')
-              .select('*, profiles:profiles!demo_transactions_user_id_fkey(full_name, scania_id, email)')
-              .order('created_at', { ascending: false }),
-            supabase.from('demo_user_products').select('*').order('started_at', { ascending: false }),
-            supabase.from('bonus_codes').select('*').order('created_at', { ascending: false }),
-            supabase
-              .from('referral_records')
-              .select(
-                '*, referred:profiles!referral_records_referred_user_id_fkey(id, full_name, scania_id, email, tier, created_at), referrer:profiles!referral_records_referrer_id_fkey(id, full_name, scania_id)'
-              )
-              .order('created_at', { ascending: false }),
-            supabase
-              .from('support_tickets')
-              .select('*, profiles:profiles!support_tickets_user_id_fkey(full_name, scania_id, email)')
-              .order('updated_at', { ascending: false }),
-            supabase.from('admin_audit_logs').select('*').order('created_at', { ascending: false }).limit(50),
-          ]);
+        }
 
-          if (profRes.data) setAllProfiles(profRes.data as Profile[]);
-          if (allTxRes.data) setAllTransactions(allTxRes.data as unknown as DemoTransaction[]);
-          if (allProdRes.data) setAllUserProducts(allProdRes.data as DemoUserProduct[]);
-          if (bonusRes.data) setAllBonusCodes(bonusRes.data as BonusCode[]);
-          if (allRefRes.data) setAllReferrals(allRefRes.data as unknown as ReferralRecord[]);
-          if (allTicketsRes.data) setAllTickets(allTicketsRes.data as unknown as SupportTicket[]);
-          if (logsRes.data) setAuditLogs(logsRes.data as AdminAuditLog[]);
+        if (!fetchedViaAdminApi) {
+          const directOk = await fetchAdminDirectlyFromSupabase();
+          if (directOk) {
+            setRealtimeStatus('connected');
+          }
         }
       }
     } finally {
       setLoadingData(false);
     }
-  }, [user?.id, isAdmin, fetchServerUserState]);
+  }, [
+    user?.id,
+    isAdmin,
+    authLoading,
+    fetchServerUserState,
+    fetchAdminDirectlyFromSupabase,
+    plans.length,
+    announcements.length,
+    notifications.length,
+  ]);
 
   useEffect(() => {
-    fetchPublicAndUser();
+    void fetchPublicAndUser();
   }, [fetchPublicAndUser]);
 
   // Real-time SSE stream + Cloudflare/workers.dev resilient 4s polling & focus sync
@@ -427,6 +534,12 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         void fetchPublicAndUser(true);
         void refreshProfile();
       });
+      es.onerror = () => {
+        if (es && es.readyState === EventSource.CLOSED) {
+          es.close();
+          es = null;
+        }
+      };
     }
 
     const syncNow = () => {
@@ -454,15 +567,19 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
 
     const channel = supabase
       .channel('scania-platform-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'site_settings' }, () => fetchPublicAndUser())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'plans' }, () => fetchPublicAndUser())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'announcements' }, () => fetchPublicAndUser())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'banners' }, () => fetchPublicAndUser())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications' }, () => fetchPublicAndUser())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'demo_transactions' }, () => fetchPublicAndUser())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'demo_user_products' }, () => fetchPublicAndUser())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'support_tickets' }, () => fetchPublicAndUser())
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'bonus_codes' }, () => fetchPublicAndUser())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, () => {
+        void fetchPublicAndUser(true);
+        void refreshProfile();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'site_settings' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'plans' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'announcements' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'banners' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'notifications' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'demo_transactions' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'demo_user_products' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'support_tickets' }, () => void fetchPublicAndUser(true))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'bonus_codes' }, () => void fetchPublicAndUser(true))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'support_messages' }, (payload) => {
         const msg = payload.new as SupportMessage;
         if (msg?.ticket_id) {
@@ -480,7 +597,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
     return () => {
       supabase?.removeChannel(channel);
     };
-  }, [fetchPublicAndUser, isPreviewMode]);
+  }, [fetchPublicAndUser, refreshProfile, isPreviewMode]);
 
   const loadTicketMessages = useCallback(async (ticketId: string) => {
     if (!supabase) return;

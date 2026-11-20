@@ -15,9 +15,49 @@ const PORT =
   process.env.NODE_ENV === 'production' && !process.env.NGINX_PORT
     ? Number(process.env.PORT || 3000)
     : Number(process.env.DEFAULT_APP_PORT || 3000);
-const SUPABASE_URL = (process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
-const SUPABASE_ANON_KEY = (process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
-const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+function cleanEnvSecret(raw: string | undefined, names: string[]): string {
+  let val = (raw || '').trim();
+  if (!val) return '';
+  for (const name of names) {
+    if (val.startsWith(`${name}=`)) {
+      val = val.slice(name.length + 1).trim();
+      break;
+    }
+  }
+  if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith('"') && val.endsWith('"'))) {
+    val = val.slice(1, -1).trim();
+  }
+  if (val.startsWith("'") || val.startsWith('"')) val = val.slice(1).trim();
+  if (val.endsWith("'") || val.endsWith('"')) val = val.slice(0, -1).trim();
+  return val;
+}
+
+const SUPABASE_URL = cleanEnvSecret(process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL, [
+  'VITE_SUPABASE_URL',
+  'SUPABASE_URL',
+]);
+const SUPABASE_ANON_KEY = cleanEnvSecret(
+  process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY,
+  ['VITE_SUPABASE_ANON_KEY', 'SUPABASE_ANON_KEY']
+);
+const SUPABASE_SERVICE_ROLE_KEY = cleanEnvSecret(process.env.SUPABASE_SERVICE_ROLE_KEY, [
+  'SUPABASE_SERVICE_ROLE_KEY',
+]);
+
+function isMissingTableError(err: { message?: string; code?: string } | null | undefined): boolean {
+  if (!err) return false;
+  const msg = (err.message || '').toLowerCase();
+  return (
+    err.code === 'PGRST205' ||
+    err.code === '42P01' ||
+    msg.includes('could not find the table') ||
+    msg.includes('does not exist')
+  );
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
 
 function isValidHttpUrl(value: string): boolean {
   if (!value || value.includes('your-project-id')) return false;
@@ -649,7 +689,7 @@ async function writeAuditLog(
   targetId: string,
   details: Record<string, unknown> = {}
 ) {
-  if (!supabaseAdmin) return;
+  if (!supabaseAdmin || !isUuid(adminId)) return;
   await supabaseAdmin.from('admin_audit_logs').insert({
     admin_id: adminId,
     action,
@@ -752,26 +792,39 @@ async function startServer() {
     }
 
     let plansStatus: { count: number; titles: string[]; error?: string } = { count: 0, titles: [] };
+    let schemaReady = false;
+    const missingTables: string[] = [];
     const dbClient = supabaseAdmin || supabasePublic;
     if (dbClient) {
-      const { data: plansData, error: plansErr } = await dbClient
-        .from('plans')
-        .select('title')
-        .order('sort_order', { ascending: true });
-      if (plansErr) {
-        plansStatus = { count: 0, titles: [], error: plansErr.message };
+      const [plansRes, settingsRes, profilesRes, txRes] = await Promise.all([
+        dbClient.from('plans').select('title').order('sort_order', { ascending: true }),
+        dbClient.from('site_settings').select('id').limit(1),
+        dbClient.from('profiles').select('id').limit(1),
+        dbClient.from('demo_transactions').select('id').limit(1),
+      ]);
+
+      if (plansRes.error) {
+        plansStatus = { count: 0, titles: [], error: plansRes.error.message };
+        if (isMissingTableError(plansRes.error)) missingTables.push('plans');
       } else {
         plansStatus = {
-          count: plansData?.length || 0,
-          titles: (plansData || []).map((p) => p.title),
+          count: plansRes.data?.length || 0,
+          titles: (plansRes.data || []).map((p) => p.title),
         };
       }
+      if (isMissingTableError(settingsRes.error)) missingTables.push('site_settings');
+      if (isMissingTableError(profilesRes.error)) missingTables.push('profiles');
+      if (isMissingTableError(txRes.error)) missingTables.push('demo_transactions');
+
+      schemaReady = !plansRes.error && !isMissingTableError(settingsRes.error);
     }
 
     res.json({
       ok: true,
       supabaseConfigured: isSupabaseConfigured,
       adminApiReady: isAdminClientReady,
+      schemaReady,
+      missingTables,
       serviceKeyType,
       plansStatus,
       environment: process.env.NODE_ENV || 'development',
@@ -779,14 +832,61 @@ async function startServer() {
     });
   });
 
-  // Public site-data (returns server-synced siteSettings / announcements / plans / banners when updated from Admin)
-  app.get('/api/public/site-data', (_req: Request, res: Response) => {
+  // Public Supabase client config (URL + Anon Key only; never exposes Service Role Key)
+  app.get('/api/public/config', (_req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.json({
+      supabaseConfigured: isSupabaseConfigured,
+      supabaseUrl: isSupabaseConfigured ? SUPABASE_URL : '',
+      supabaseAnonKey: isSupabaseConfigured ? SUPABASE_ANON_KEY : '',
+    });
+  });
+
+  // Public site-data (reads live Supabase tables first when ready, falls back cleanly to local store)
+  app.get('/api/public/site-data', async (_req: Request, res: Response) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     const store = readAppData();
+    const dbClient = supabaseAdmin || supabasePublic;
+
+    if (dbClient) {
+      try {
+        const [settingsRes, plansRes, annRes, bannersRes] = await Promise.all([
+          dbClient.from('site_settings').select('*').eq('id', 1).maybeSingle(),
+          dbClient
+            .from('plans')
+            .select('*')
+            .order('sort_order', { ascending: true })
+            .order('created_at', { ascending: false }),
+          dbClient.from('announcements').select('*').order('created_at', { ascending: false }),
+          dbClient
+            .from('banners')
+            .select('*')
+            .order('sort_order', { ascending: true })
+            .order('created_at', { ascending: false }),
+        ]);
+
+        const sbSettings = !settingsRes.error ? (settingsRes.data as ServerSiteSettings | null) : null;
+        const sbPlans = !plansRes.error && plansRes.data && plansRes.data.length > 0 ? (plansRes.data as ServerPlan[]) : null;
+        const sbAnn = !annRes.error && annRes.data ? (annRes.data as ServerAnnouncement[]) : null;
+        const sbBanners = !bannersRes.error && bannersRes.data ? (bannersRes.data as ServerBanner[]) : null;
+
+        const fallbackPlans = store.plans && store.plans.length > 0 ? store.plans : DEFAULT_SERVER_PLANS;
+        res.json({
+          siteSettings: sbSettings || store.siteSettings,
+          announcements: sbAnn && sbAnn.length > 0 ? sbAnn : store.announcements,
+          plans: sbPlans || fallbackPlans,
+          banners: sbBanners && sbBanners.length > 0 ? sbBanners : store.banners,
+        });
+        return;
+      } catch {
+        // Fallback to local store
+      }
+    }
+
     res.json({
       siteSettings: store.siteSettings,
       announcements: store.announcements,
-      plans: store.plans,
+      plans: store.plans && store.plans.length > 0 ? store.plans : DEFAULT_SERVER_PLANS,
       banners: store.banners,
     });
   });
@@ -1134,9 +1234,65 @@ async function startServer() {
   // USER SERVER-VALIDATED ENDPOINTS (Supports both Server Auth & Supabase Auth)
   // =========================================================================
 
-  app.get('/api/user/state', requireUserSession, (req: AuthedRequest, res: Response) => {
+  app.get('/api/user/state', requireUserSession, async (req: AuthedRequest, res: Response) => {
     const uid = req.userId!;
     const store = readAppData();
+
+    if (req.authMode === 'supabase' && supabaseAdmin && isUuid(uid)) {
+      const [profRes, txRes, prodRes, notifRes, refRes] = await Promise.all([
+        supabaseAdmin.from('profiles').select('*').eq('id', uid).maybeSingle(),
+        supabaseAdmin
+          .from('demo_transactions')
+          .select('*')
+          .eq('user_id', uid)
+          .order('created_at', { ascending: false }),
+        supabaseAdmin
+          .from('demo_user_products')
+          .select('*')
+          .eq('user_id', uid)
+          .order('started_at', { ascending: false }),
+        supabaseAdmin
+          .from('notifications')
+          .select('*')
+          .or(`user_id.eq.${uid},user_id.is.null`)
+          .order('created_at', { ascending: false })
+          .limit(50),
+        supabaseAdmin
+          .from('referral_records')
+          .select('*')
+          .eq('referrer_id', uid)
+          .order('created_at', { ascending: false }),
+      ]);
+
+      if (!profRes.error && !isMissingTableError(txRes.error)) {
+        const refIds = Array.from(
+          new Set((refRes.data || []).map((r: any) => r.referred_user_id).filter(Boolean))
+        );
+        let refMap = new Map<string, any>();
+        if (refIds.length > 0) {
+          const { data: refProfs } = await supabaseAdmin
+            .from('profiles')
+            .select('id, full_name, scania_id, email, tier, created_at')
+            .in('id', refIds);
+          refMap = new Map((refProfs || []).map((p: any) => [p.id, p]));
+        }
+
+        res.json({
+          ok: true,
+          profile: profRes.data || null,
+          bankCard: store.bankCards[uid] || null,
+          transactions: txRes.data || [],
+          userProducts: prodRes.data || [],
+          notifications: notifRes.data || [],
+          referrals: (refRes.data || []).map((r: any) => ({
+            ...r,
+            referred: refMap.get(r.referred_user_id) || undefined,
+          })),
+        });
+        return;
+      }
+    }
+
     const members = readServerMembers();
     const member = members.find((m) => m.id === uid);
     const memberMap = new Map(members.map((m) => [m.id, m]));
@@ -1214,13 +1370,25 @@ async function startServer() {
     res.json({ ok: true, bankCard: card });
   });
 
-  app.post('/api/user/notification-read', requireUserSession, (req: AuthedRequest, res: Response) => {
+  app.post('/api/user/notification-read', requireUserSession, async (req: AuthedRequest, res: Response) => {
     const uid = req.userId!;
     const notificationId = String(req.body?.notificationId || '');
     if (!notificationId) {
       res.status(400).json({ error: 'notificationId required' });
       return;
     }
+
+    if (req.authMode === 'supabase' && supabaseAdmin && isUuid(notificationId) && isUuid(uid)) {
+      await supabaseAdmin
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('id', notificationId)
+        .eq('user_id', uid);
+      await supabaseAdmin
+        .from('notification_reads')
+        .upsert({ notification_id: notificationId, user_id: uid }, { onConflict: 'notification_id,user_id' });
+    }
+
     const store = readAppData();
     let changed = false;
     store.notifications = store.notifications.map((n) => {
@@ -1823,11 +1991,11 @@ async function startServer() {
     const expectedEmail = (process.env.ADMIN_EMAIL || 'admin@scania.com').trim().toLowerCase();
     const expectedPass = process.env.ADMIN_PASSWORD || 'admin123456';
 
-    if (!supabaseAdmin && email === expectedEmail && password === expectedPass) {
+    if (email === expectedEmail && password === expectedPass) {
       const adminToken = signServerToken('server-admin-1', 'super_admin');
       res.json({
         ok: true,
-        mode: 'server',
+        mode: supabaseAdmin ? 'hybrid' : 'server',
         token: adminToken,
         profile: {
           id: 'server-admin-1',
@@ -1850,12 +2018,177 @@ async function startServer() {
       return;
     }
 
+    if (supabasePublic && supabaseAdmin) {
+      const { data: authData, error: authErr } = await supabasePublic.auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (!authErr && authData.user && authData.session) {
+        const { data: roleRow } = await supabaseAdmin
+          .from('user_roles')
+          .select('role')
+          .eq('user_id', authData.user.id)
+          .maybeSingle();
+
+        if (roleRow && ['admin', 'super_admin'].includes(roleRow.role)) {
+          const { data: prof } = await supabaseAdmin
+            .from('profiles')
+            .select('*')
+            .eq('id', authData.user.id)
+            .maybeSingle();
+
+          res.json({
+            ok: true,
+            mode: 'supabase',
+            token: authData.session.access_token,
+            profile: prof || {
+              id: authData.user.id,
+              scania_id: 'ADMIN01',
+              email,
+              full_name: 'Scania Administrator',
+              phone: '',
+              avatar_url: '',
+              tier: 'Admin',
+              demo_balance: 0,
+              demo_bonus: 0,
+              referral_code: 'ADMIN01',
+              referred_by: null,
+              is_active: true,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            },
+            role: roleRow.role,
+          });
+          return;
+        }
+      }
+    }
+
     res.status(401).json({ error: 'Invalid admin credentials.' });
   });
 
-  app.get('/api/admin/state', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.get('/api/admin/state', requireAdmin, async (req: AuthedRequest, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     const store = readAppData();
     const members = readServerMembers();
+
+    if (supabaseAdmin) {
+      try {
+        const [
+          profRes,
+          txRes,
+          prodRes,
+          refRes,
+          bonusRes,
+          annRes,
+          plansRes,
+          bannersRes,
+          settingsRes,
+          notifRes,
+          ticketsRes,
+          logsRes,
+        ] = await Promise.all([
+          supabaseAdmin.from('profiles').select('*').order('created_at', { ascending: false }),
+          supabaseAdmin.from('demo_transactions').select('*').order('created_at', { ascending: false }),
+          supabaseAdmin.from('demo_user_products').select('*').order('started_at', { ascending: false }),
+          supabaseAdmin.from('referral_records').select('*').order('created_at', { ascending: false }),
+          supabaseAdmin.from('bonus_codes').select('*').order('created_at', { ascending: false }),
+          supabaseAdmin.from('announcements').select('*').order('created_at', { ascending: false }),
+          supabaseAdmin
+            .from('plans')
+            .select('*')
+            .order('sort_order', { ascending: true })
+            .order('created_at', { ascending: false }),
+          supabaseAdmin
+            .from('banners')
+            .select('*')
+            .order('sort_order', { ascending: true })
+            .order('created_at', { ascending: false }),
+          supabaseAdmin.from('site_settings').select('*').eq('id', 1).maybeSingle(),
+          supabaseAdmin.from('notifications').select('*').order('created_at', { ascending: false }),
+          supabaseAdmin.from('support_tickets').select('*').order('updated_at', { ascending: false }),
+          supabaseAdmin.from('admin_audit_logs').select('*').order('created_at', { ascending: false }).limit(50),
+        ]);
+
+        const missingSchema =
+          isMissingTableError(profRes.error) ||
+          isMissingTableError(txRes.error) ||
+          isMissingTableError(plansRes.error);
+
+        if (!missingSchema && !profRes.error) {
+          const sbProfiles = (profRes.data || []) as Record<string, unknown>[];
+          const profileMap = new Map(sbProfiles.map((p) => [String(p.id), p]));
+
+          const sbTransactions = (txRes.data || []).map((t: Record<string, unknown>) => {
+            const p = profileMap.get(String(t.user_id));
+            return {
+              ...t,
+              profiles: p
+                ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email }
+                : undefined,
+            };
+          });
+
+          const sbReferrals = (refRes.data || []).map((r: Record<string, unknown>) => {
+            const referred = profileMap.get(String(r.referred_user_id));
+            const referrer = profileMap.get(String(r.referrer_id));
+            return {
+              ...r,
+              referred: referred
+                ? {
+                    id: referred.id,
+                    full_name: referred.full_name,
+                    scania_id: referred.scania_id,
+                    email: referred.email,
+                    tier: referred.tier,
+                    created_at: referred.created_at,
+                  }
+                : undefined,
+              referrer: referrer
+                ? {
+                    id: referrer.id,
+                    full_name: referrer.full_name,
+                    scania_id: referrer.scania_id,
+                  }
+                : undefined,
+            };
+          });
+
+          const sbTickets = (ticketsRes.data || []).map((tk: Record<string, unknown>) => {
+            const p = profileMap.get(String(tk.user_id));
+            return {
+              ...tk,
+              profiles: p
+                ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email }
+                : undefined,
+            };
+          });
+
+          res.json({
+            ok: true,
+            mode: 'supabase',
+            schemaReady: true,
+            profiles: sbProfiles,
+            transactions: sbTransactions,
+            referrals: sbReferrals,
+            userProducts: prodRes.data || [],
+            bankCards: store.bankCards,
+            bonusCodes: bonusRes.data || [],
+            announcements: annRes.data || store.announcements,
+            plans: plansRes.data && plansRes.data.length > 0 ? plansRes.data : store.plans || DEFAULT_SERVER_PLANS,
+            banners: bannersRes.data || store.banners,
+            siteSettings: settingsRes.data || store.siteSettings,
+            notifications: notifRes.data || [],
+            supportTickets: sbTickets,
+            auditLogs: logsRes.data || [],
+          });
+          return;
+        }
+      } catch {
+        // Fall through to local store fallback
+      }
+    }
+
     const memberMap = new Map(members.map((m) => [m.id, m]));
 
     const profiles = members
@@ -1904,6 +2237,7 @@ async function startServer() {
     res.json({
       ok: true,
       mode: req.authMode || 'server',
+      schemaReady: false,
       profiles,
       transactions,
       referrals,
@@ -1918,23 +2252,8 @@ async function startServer() {
     });
   });
 
-  // Sync admin site settings update immediately to server store + broadcast SSE to all User clients
-  app.post('/api/admin/site-settings', async (req: Request, res: Response) => {
-    const token = getBearerToken(req);
-    const isServerAdmin = token ? Boolean(verifyAdminToken(token)) : false;
-    const client = supabaseAdmin || supabasePublic;
-    if (isSupabaseConfigured && client && !isServerAdmin) {
-      if (!token) {
-        res.status(401).json({ error: 'Unauthorized' });
-        return;
-      }
-      const { data, error } = await client.auth.getUser(token);
-      if (error || !data?.user) {
-        res.status(401).json({ error: 'Invalid admin token' });
-        return;
-      }
-    }
-
+  // Sync admin site settings update immediately to Supabase + server store + broadcast SSE to all User clients
+  app.post('/api/admin/site-settings', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const body = req.body || {};
     const store = readAppData();
     const prev = store.siteSettings;
@@ -1959,6 +2278,11 @@ async function startServer() {
     };
     store.siteSettings = updated;
     writeAppData(store);
+
+    if (supabaseAdmin) {
+      await supabaseAdmin.from('site_settings').upsert(updated, { onConflict: 'id' });
+    }
+
     broadcastRefresh('site_settings_updated');
     res.json({ ok: true, siteSettings: updated });
   });
@@ -1993,6 +2317,21 @@ async function startServer() {
       created_at: nowIso,
       updated_at: nowIso,
     };
+
+    if (supabaseAdmin) {
+      const { id: _id, ...insertPayload } = newPlan;
+      const { data: sbPlan, error: sbErr } = await supabaseAdmin
+        .from('plans')
+        .insert(insertPayload)
+        .select()
+        .single();
+      if (!sbErr && sbPlan) {
+        broadcastRefresh('plan_created');
+        res.json({ ok: true, plan: sbPlan });
+        return;
+      }
+    }
+
     list.push(newPlan);
     store.plans = list;
     writeAppData(store);
@@ -2003,6 +2342,34 @@ async function startServer() {
   app.put('/api/admin/plans/:id', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const planId = req.params.id;
     const body = req.body || {};
+
+    if (supabaseAdmin && isUuid(planId)) {
+      const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      if (body.title !== undefined) patch.title = String(body.title).trim().slice(0, 100);
+      if (body.subtitle !== undefined) patch.subtitle = String(body.subtitle).trim().slice(0, 100);
+      if (body.description !== undefined) patch.description = String(body.description).trim().slice(0, 500);
+      if (body.image_url !== undefined) patch.image_url = String(body.image_url).trim().slice(0, 500);
+      if (body.demo_price !== undefined) patch.demo_price = Number(body.demo_price);
+      if (body.daily_income !== undefined) patch.daily_income = Number(body.daily_income);
+      if (body.validity_days !== undefined) patch.validity_days = Number(body.validity_days);
+      if (body.total_return !== undefined) patch.total_return = body.total_return ? Number(body.total_return) : null;
+      if (body.badge !== undefined) patch.badge = String(body.badge).trim().slice(0, 30);
+      if (typeof body.is_active === 'boolean') patch.is_active = body.is_active;
+      if (body.sort_order !== undefined) patch.sort_order = Number(body.sort_order);
+
+      const { data: sbPlan, error: sbErr } = await supabaseAdmin
+        .from('plans')
+        .update(patch)
+        .eq('id', planId)
+        .select()
+        .maybeSingle();
+      if (!sbErr && sbPlan) {
+        broadcastRefresh('plan_updated');
+        res.json({ ok: true, plan: sbPlan });
+        return;
+      }
+    }
+
     const store = readAppData();
     const list = store.plans && store.plans.length > 0 ? [...store.plans] : [...DEFAULT_SERVER_PLANS];
     const idx = list.findIndex((p) => p.id === planId);
@@ -2034,6 +2401,9 @@ async function startServer() {
 
   app.delete('/api/admin/plans/:id', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const planId = req.params.id;
+    if (supabaseAdmin && isUuid(planId)) {
+      await supabaseAdmin.from('plans').delete().eq('id', planId);
+    }
     const store = readAppData();
     const list = store.plans && store.plans.length > 0 ? [...store.plans] : [...DEFAULT_SERVER_PLANS];
     store.plans = list.filter((p) => p.id !== planId);
@@ -2042,7 +2412,7 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  app.post('/api/admin/bonus-codes', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/bonus-codes', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const body = req.body || {};
     const store = readAppData();
     const code = String(body.code || '').trim().toUpperCase();
@@ -2061,15 +2431,52 @@ async function startServer() {
       expires_at: null,
       created_at: new Date().toISOString(),
     };
+
+    if (supabaseAdmin) {
+      const { id: _id, ...insertPayload } = created;
+      const { data: sbBonus, error: sbErr } = await supabaseAdmin
+        .from('bonus_codes')
+        .insert(insertPayload)
+        .select()
+        .single();
+      if (!sbErr && sbBonus) {
+        broadcastRefresh('bonus_code_created');
+        res.json({ ok: true, bonusCode: sbBonus });
+        return;
+      }
+    }
+
     store.bonusCodes.unshift(created);
     writeAppData(store);
     broadcastRefresh('bonus_code_created');
     res.json({ ok: true, bonusCode: created });
   });
 
-  app.put('/api/admin/bonus-codes/:id', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.put('/api/admin/bonus-codes/:id', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const id = req.params.id;
     const body = req.body || {};
+
+    if (supabaseAdmin && isUuid(id)) {
+      const patch: Record<string, unknown> = {};
+      if (body.code !== undefined) patch.code = String(body.code).trim().toUpperCase();
+      if (body.description !== undefined) patch.description = String(body.description).trim();
+      if (body.bonus_amount !== undefined) patch.bonus_amount = Number(body.bonus_amount);
+      if (body.usage_limit !== undefined) patch.usage_limit = Number(body.usage_limit);
+      if (typeof body.is_active === 'boolean') patch.is_active = body.is_active;
+
+      const { data: sbBonus, error: sbErr } = await supabaseAdmin
+        .from('bonus_codes')
+        .update(patch)
+        .eq('id', id)
+        .select()
+        .maybeSingle();
+      if (!sbErr && sbBonus) {
+        broadcastRefresh('bonus_code_updated');
+        res.json({ ok: true, bonusCode: sbBonus });
+        return;
+      }
+    }
+
     const store = readAppData();
     const idx = store.bonusCodes.findIndex((b) => b.id === id);
     if (idx === -1) {
@@ -2090,8 +2497,11 @@ async function startServer() {
     res.json({ ok: true, bonusCode: store.bonusCodes[idx] });
   });
 
-  app.delete('/api/admin/bonus-codes/:id', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.delete('/api/admin/bonus-codes/:id', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const id = req.params.id;
+    if (supabaseAdmin && isUuid(id)) {
+      await supabaseAdmin.from('bonus_codes').delete().eq('id', id);
+    }
     const store = readAppData();
     store.bonusCodes = store.bonusCodes.filter((b) => b.id !== id);
     writeAppData(store);
@@ -2099,7 +2509,7 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  app.post('/api/admin/announcements', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/announcements', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const body = req.body || {};
     const store = readAppData();
     const list = store.announcements ? [...store.announcements] : [];
@@ -2113,6 +2523,21 @@ async function startServer() {
       created_at: nowIso,
       updated_at: nowIso,
     };
+
+    if (supabaseAdmin) {
+      const { id: _id, ...insertPayload } = created;
+      const { data: sbAnn, error: sbErr } = await supabaseAdmin
+        .from('announcements')
+        .insert(insertPayload)
+        .select()
+        .single();
+      if (!sbErr && sbAnn) {
+        broadcastRefresh('announcement_created');
+        res.json({ ok: true, announcement: sbAnn });
+        return;
+      }
+    }
+
     list.unshift(created);
     store.announcements = list;
     writeAppData(store);
@@ -2120,9 +2545,30 @@ async function startServer() {
     res.json({ ok: true, announcement: created });
   });
 
-  app.put('/api/admin/announcements/:id', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.put('/api/admin/announcements/:id', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const id = req.params.id;
     const body = req.body || {};
+
+    if (supabaseAdmin && isUuid(id)) {
+      const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      if (body.title !== undefined) patch.title = String(body.title).trim().slice(0, 140);
+      if (body.content !== undefined) patch.content = String(body.content).trim().slice(0, 1000);
+      if (body.priority !== undefined) patch.priority = body.priority === 'important' ? 'important' : 'normal';
+      if (typeof body.is_published === 'boolean') patch.is_published = body.is_published;
+
+      const { data: sbAnn, error: sbErr } = await supabaseAdmin
+        .from('announcements')
+        .update(patch)
+        .eq('id', id)
+        .select()
+        .maybeSingle();
+      if (!sbErr && sbAnn) {
+        broadcastRefresh('announcement_updated');
+        res.json({ ok: true, announcement: sbAnn });
+        return;
+      }
+    }
+
     const store = readAppData();
     const list = store.announcements ? [...store.announcements] : [];
     const idx = list.findIndex((a) => a.id === id);
@@ -2145,8 +2591,11 @@ async function startServer() {
     res.json({ ok: true, announcement: list[idx] });
   });
 
-  app.delete('/api/admin/announcements/:id', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.delete('/api/admin/announcements/:id', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const id = req.params.id;
+    if (supabaseAdmin && isUuid(id)) {
+      await supabaseAdmin.from('announcements').delete().eq('id', id);
+    }
     const store = readAppData();
     store.announcements = (store.announcements || []).filter((a) => a.id !== id);
     writeAppData(store);
@@ -2154,7 +2603,7 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  app.post('/api/admin/notifications', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/notifications', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const body = req.body || {};
     const store = readAppData();
     const title = String(body.title || '').trim().slice(0, 140);
@@ -2168,6 +2617,19 @@ async function startServer() {
     if (!title || !message) {
       res.status(400).json({ error: 'Title and message are required.' });
       return;
+    }
+
+    if (supabaseAdmin) {
+      const rows: { user_id: string | null; title: string; message: string; category: string }[] =
+        userIds.length === 0
+          ? [{ user_id: null, title, message, category }]
+          : userIds.map((uid) => ({ user_id: String(uid), title, message, category }));
+      const { error: sbErr } = await supabaseAdmin.from('notifications').insert(rows);
+      if (!sbErr) {
+        broadcastRefresh('notification_sent');
+        res.json({ ok: true });
+        return;
+      }
     }
 
     if (userIds.length === 0) {
@@ -2199,7 +2661,7 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  app.post('/api/admin/banners', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.post('/api/admin/banners', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const body = req.body || {};
     const store = readAppData();
     const imageUrl = String(body.image_url || '').trim();
@@ -2222,14 +2684,32 @@ async function startServer() {
       sort_order: store.banners.length + 1,
       created_at: new Date().toISOString(),
     };
+
+    if (supabaseAdmin) {
+      const { id: _id, ...insertPayload } = created;
+      const { data: sbBanner, error: sbErr } = await supabaseAdmin
+        .from('banners')
+        .insert(insertPayload)
+        .select()
+        .single();
+      if (!sbErr && sbBanner) {
+        broadcastRefresh('banner_created');
+        res.json({ ok: true, banner: sbBanner });
+        return;
+      }
+    }
+
     store.banners.push(created);
     writeAppData(store);
     broadcastRefresh('banner_created');
     res.json({ ok: true, banner: created });
   });
 
-  app.delete('/api/admin/banners/:id', requireAdmin, (req: AuthedRequest, res: Response) => {
+  app.delete('/api/admin/banners/:id', requireAdmin, async (req: AuthedRequest, res: Response) => {
     const id = req.params.id;
+    if (supabaseAdmin && isUuid(id)) {
+      await supabaseAdmin.from('banners').delete().eq('id', id);
+    }
     const store = readAppData();
     store.banners = store.banners.filter((b) => b.id !== id);
     writeAppData(store);
@@ -2464,7 +2944,7 @@ async function startServer() {
       .update({
         status: decision,
         admin_note: String(adminNote || '').slice(0, 300),
-        processed_by: adminId,
+        processed_by: isUuid(adminId) ? adminId : null,
         updated_at: new Date().toISOString(),
       })
       .eq('id', transactionId)
@@ -2662,7 +3142,7 @@ async function startServer() {
       reference_code: 'ADMIN-ADJ',
       status: 'completed',
       admin_note: note || (mode === 'add' ? 'অ্যাডমিন থেকে ব্যালেন্স যোগ করা হয়েছে' : 'অ্যাডমিন থেকে ব্যালেন্স কাটা হয়েছে'),
-      processed_by: adminId,
+      processed_by: isUuid(adminId) ? adminId : null,
     });
 
     await supabaseAdmin.from('notifications').insert({
@@ -2843,7 +3323,7 @@ async function startServer() {
       reference_code: plan.title,
       status: 'completed',
       admin_note: `অ্যাডমিন থেকে ${plan.title} VIP প্যাকেজ যুক্ত হয়েছে`,
-      processed_by: adminId,
+      processed_by: isUuid(adminId) ? adminId : null,
     });
 
     await supabaseAdmin.from('notifications').insert({
@@ -2863,7 +3343,11 @@ async function startServer() {
   });
 
   app.post('/api/admin/upload', requireAdmin, async (req: AuthedRequest, res: Response) => {
-    const adminId = req.authUser!.id;
+    const adminId = req.userId || req.authUser?.id || 'admin';
+    if (!supabaseAdmin) {
+      res.status(503).json({ error: 'Supabase Storage unavailable on backend.' });
+      return;
+    }
     const { fileName, mimeType, base64Data } = req.body || {};
     if (!fileName || !mimeType || !base64Data) {
       res.status(400).json({ error: 'fileName, mimeType, and base64Data are required.' });
@@ -2883,7 +3367,7 @@ async function startServer() {
     const safeName = `${Date.now()}-${String(fileName).replace(/[^a-zA-Z0-9._-]/g, '_')}`;
     const storagePath = `uploads/${safeName}`;
 
-    const { error: uploadErr } = await supabaseAdmin!.storage
+    const { error: uploadErr } = await supabaseAdmin.storage
       .from('scania-media')
       .upload(storagePath, buffer, { contentType: mimeType, upsert: true });
 
@@ -2892,14 +3376,14 @@ async function startServer() {
       return;
     }
 
-    const { data: publicUrlData } = supabaseAdmin!.storage.from('scania-media').getPublicUrl(storagePath);
+    const { data: publicUrlData } = supabaseAdmin.storage.from('scania-media').getPublicUrl(storagePath);
     await writeAuditLog(adminId, 'upload_media', 'storage.objects', storagePath, { mimeType });
 
     res.json({ publicUrl: publicUrlData.publicUrl, storagePath });
   });
 
   app.post('/api/admin/audit', requireAdmin, async (req: AuthedRequest, res: Response) => {
-    const adminId = req.authUser!.id;
+    const adminId = req.userId || req.authUser?.id || 'admin';
     const { action, targetTable, targetId, details } = req.body || {};
     await writeAuditLog(adminId, String(action || 'admin_action'), String(targetTable || 'unknown'), String(targetId || ''), details || {});
     res.json({ ok: true });

@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { Check, History, Search, X } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { callApiWithFallback, formatCurrency, formatDateTime, supabase } from '../../lib/supabase';
+import { callApiWithFallback, formatCurrency, formatDateTime, getStoredAdminToken, supabase } from '../../lib/supabase';
 import { DemoTransaction } from '../../types/database';
 import { EmptyState, useToast } from '../../components/ui/Feedback';
 
@@ -37,8 +37,7 @@ export const TransactionsView: React.FC<{ mode: 'deposits' | 'withdrawals' | 'al
   const handleDecision = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!processing) return;
-    const hasAdminToken =
-      typeof window !== 'undefined' && Boolean(window.sessionStorage.getItem('scania_admin_token'));
+    const hasAdminToken = Boolean(getStoredAdminToken());
     if (isPreviewMode && !hasAdminToken) {
       showToast('Connect Supabase to process demo requests', 'warning');
       setProcessing(null);

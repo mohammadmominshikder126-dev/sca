@@ -19,7 +19,7 @@ import {
 import { ScaniaImage, ScaniaLogoEmblem } from '../../components/ScaniaVisuals';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { callApiWithFallback, formatCurrency, formatRelativeTime, supabase } from '../../lib/supabase';
+import { callApiWithFallback, formatCurrency, formatRelativeTime, getStoredAdminToken, supabase } from '../../lib/supabase';
 import { DemoTransaction } from '../../types/database';
 import { useToast } from '../../components/ui/Feedback';
 
@@ -98,8 +98,7 @@ export const DashboardView: React.FC = () => {
   const handleProcessTransaction = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!processingTx) return;
-    const hasAdminToken =
-      typeof window !== 'undefined' && Boolean(window.sessionStorage.getItem('scania_admin_token'));
+    const hasAdminToken = Boolean(getStoredAdminToken());
     if (isPreviewMode && !hasAdminToken) {
       showToast('Connect Supabase to process requests', 'warning');
       setProcessingTx(null);
@@ -346,16 +345,32 @@ export const DashboardView: React.FC = () => {
           <div className="rounded-2xl p-4 bg-[#061844] text-white shadow-sm space-y-2.5 text-xs">
             <div className="flex items-center justify-between">
               <span className="font-display font-bold text-sm">Demo Database Status</span>
-              <span className={realtimeStatus === 'connected' ? 'text-emerald-400 font-semibold' : 'text-amber-300 font-semibold'}>
-                {realtimeStatus === 'connected' ? 'Connected' : 'Preview'}
+              <span
+                className={
+                  realtimeStatus === 'connected'
+                    ? 'text-emerald-400 font-semibold'
+                    : realtimeStatus === 'connecting'
+                    ? 'text-sky-300 font-semibold'
+                    : 'text-amber-300 font-semibold'
+                }
+              >
+                {realtimeStatus === 'connected' ? 'Connected' : realtimeStatus === 'connecting' ? 'Connecting...' : 'Preview'}
               </span>
             </div>
             <div className="flex items-center justify-between text-blue-100">
               <span className="inline-flex items-center gap-1.5">
                 <Database className="w-3.5 h-3.5 text-blue-300" /> Supabase Postgres
               </span>
-              <span className="font-semibold text-emerald-300">
-                {realtimeStatus === 'connected' ? 'Active' : 'Setup Needed'}
+              <span
+                className={
+                  realtimeStatus === 'connected'
+                    ? 'font-semibold text-emerald-300'
+                    : realtimeStatus === 'connecting'
+                    ? 'font-semibold text-sky-300'
+                    : 'font-semibold text-amber-300'
+                }
+              >
+                {realtimeStatus === 'connected' ? 'Active' : realtimeStatus === 'connecting' ? 'Syncing...' : 'Setup Needed'}
               </span>
             </div>
             <div className="flex items-center justify-between text-blue-100">

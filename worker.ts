@@ -7,6 +7,11 @@ interface Env {
   SESSION_SECRET?: string;
   ADMIN_EMAIL?: string;
   ADMIN_PASSWORD?: string;
+  SUPABASE_URL?: string;
+  VITE_SUPABASE_URL?: string;
+  SUPABASE_ANON_KEY?: string;
+  VITE_SUPABASE_ANON_KEY?: string;
+  SUPABASE_SERVICE_ROLE_KEY?: string;
 }
 
 interface WorkerMemberRecord {
@@ -539,19 +544,243 @@ function ensureMemberFromClaims(state: WorkerState, claims: TokenClaims): Worker
   return rehydrated;
 }
 
+function cleanEnvSecret(raw: string | undefined, names: string[]): string {
+  let val = (raw || '').trim();
+  if (!val) return '';
+  for (const name of names) {
+    if (val.startsWith(`${name}=`)) {
+      val = val.slice(name.length + 1).trim();
+      break;
+    }
+  }
+  if ((val.startsWith("'") && val.endsWith("'")) || (val.startsWith('"') && val.endsWith('"'))) {
+    val = val.slice(1, -1).trim();
+  }
+  if (val.startsWith("'") || val.startsWith('"')) val = val.slice(1).trim();
+  if (val.endsWith("'") || val.endsWith('"')) val = val.slice(0, -1).trim();
+  return val;
+}
+
+function isValidHttpUrl(value: string): boolean {
+  if (!value || value.includes('your-project-id')) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function decodeJwtRole(token: string): string | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(new TextDecoder().decode(fromBase64Url(parts[1]))) as { role?: string };
+    return payload.role || null;
+  } catch {
+    return null;
+  }
+}
+
+function isValidServiceRoleKey(key: string): boolean {
+  if (!key) return false;
+  if (key.startsWith('sb_secret_')) return true;
+  if (key.startsWith('sb_publishable_')) return false;
+  return decodeJwtRole(key) === 'service_role';
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+interface WorkerSupabaseConfig {
+  url: string;
+  anonKey: string;
+  serviceKey: string;
+  publicReady: boolean;
+  adminReady: boolean;
+  serviceKeyType: string;
+}
+
+function getSupabaseConfig(env: Env): WorkerSupabaseConfig {
+  const url = cleanEnvSecret(env.VITE_SUPABASE_URL || env.SUPABASE_URL, ['VITE_SUPABASE_URL', 'SUPABASE_URL']).replace(/\/+$/, '');
+  const anonKey = cleanEnvSecret(env.VITE_SUPABASE_ANON_KEY || env.SUPABASE_ANON_KEY, [
+    'VITE_SUPABASE_ANON_KEY',
+    'SUPABASE_ANON_KEY',
+  ]);
+  const serviceKey = cleanEnvSecret(env.SUPABASE_SERVICE_ROLE_KEY, ['SUPABASE_SERVICE_ROLE_KEY']);
+
+  let serviceKeyType = 'none';
+  if (serviceKey) {
+    if (serviceKey.startsWith('sb_secret_')) serviceKeyType = 'sb_secret';
+    else if (serviceKey.startsWith('sb_publishable_')) serviceKeyType = 'sb_publishable';
+    else if (serviceKey.split('.').length === 3) {
+      const role = decodeJwtRole(serviceKey);
+      serviceKeyType = role ? `jwt-${role}` : 'jwt-malformed';
+    } else {
+      serviceKeyType = 'other';
+    }
+  }
+
+  const validUrl = isValidHttpUrl(url);
+  const publicReady = Boolean(validUrl && anonKey && !anonKey.includes('your-supabase-anon-key'));
+  const adminReady = Boolean(validUrl && isValidServiceRoleKey(serviceKey));
+
+  return { url, anonKey, serviceKey, publicReady, adminReady, serviceKeyType };
+}
+
+function isMissingTableMsg(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return lower.includes('could not find the table') || lower.includes('does not exist') || lower.includes('pgrst205');
+}
+
+async function sbRest<T = unknown>(
+  cfg: WorkerSupabaseConfig,
+  path: string,
+  options: {
+    method?: string;
+    body?: unknown;
+    useService?: boolean;
+    prefer?: string;
+    bearerToken?: string;
+  } = {}
+): Promise<{ data: T | null; error: string | null; status: number }> {
+  const key = options.useService ? cfg.serviceKey : cfg.anonKey;
+  if (!cfg.url || !key) return { data: null, error: 'Supabase not configured', status: 503 };
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/${path}`, {
+      method: options.method || 'GET',
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${options.bearerToken || key}`,
+        'Content-Type': 'application/json',
+        ...(options.prefer ? { Prefer: options.prefer } : {}),
+      },
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+    });
+    const text = await res.text();
+    let parsed: unknown = null;
+    if (text) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+    }
+    if (!res.ok) {
+      const errMsg =
+        parsed && typeof parsed === 'object' && 'message' in parsed
+          ? String((parsed as { message: unknown }).message)
+          : text || `HTTP ${res.status}`;
+      return { data: null, error: errMsg, status: res.status };
+    }
+    return { data: parsed as T, error: null, status: res.status };
+  } catch (err) {
+    return { data: null, error: (err as Error).message, status: 500 };
+  }
+}
+
+async function sbGetAuthUser(cfg: WorkerSupabaseConfig, jwt: string): Promise<{ id: string; email?: string } | null> {
+  const key = cfg.serviceKey || cfg.anonKey;
+  if (!cfg.url || !key || !jwt) return null;
+  try {
+    const res = await fetch(`${cfg.url}/auth/v1/user`, {
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${jwt}`,
+      },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { id?: string; email?: string };
+    return data.id ? { id: data.id, email: data.email } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function sbSignInPassword(
+  cfg: WorkerSupabaseConfig,
+  email: string,
+  password: string
+): Promise<{ user?: { id: string; email?: string }; access_token?: string; error?: string }> {
+  const key = cfg.anonKey || cfg.serviceKey;
+  if (!cfg.url || !key) return { error: 'Supabase auth unavailable' };
+  const res = await fetch(`${cfg.url}/auth/v1/token?grant_type=password`, {
+    method: 'POST',
+    headers: {
+      apikey: key,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ email, password }),
+  });
+  const json = (await res.json().catch(() => ({}))) as {
+    user?: { id: string; email?: string };
+    access_token?: string;
+    msg?: string;
+    error_description?: string;
+    error?: string;
+  };
+  if (!res.ok || !json.user || !json.access_token) {
+    return { error: json.error_description || json.msg || json.error || 'Invalid credentials' };
+  }
+  return { user: json.user, access_token: json.access_token };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const pathname = url.pathname;
     const method = request.method.toUpperCase();
     const secret = env.SESSION_SECRET || 'scania-platform-session-key';
+    const sb = getSupabaseConfig(env);
 
     if (pathname === '/api/health') {
+      let plansStatus: { count: number; titles: string[]; error?: string } = { count: 0, titles: [] };
+      let schemaReady = false;
+      const missingTables: string[] = [];
+
+      if (sb.adminReady || sb.publicReady) {
+        const useService = sb.adminReady;
+        const [plansRes, settingsRes, profilesRes, txRes] = await Promise.all([
+          sbRest<{ title: string }[]>(sb, 'plans?select=title&order=sort_order.asc', { useService }),
+          sbRest<unknown[]>(sb, 'site_settings?select=id&limit=1', { useService }),
+          sbRest<unknown[]>(sb, 'profiles?select=id&limit=1', { useService }),
+          sbRest<unknown[]>(sb, 'demo_transactions?select=id&limit=1', { useService }),
+        ]);
+
+        if (plansRes.error) {
+          plansStatus = { count: 0, titles: [], error: plansRes.error };
+          if (isMissingTableMsg(plansRes.error)) missingTables.push('plans');
+        } else {
+          const rows = plansRes.data || [];
+          plansStatus = { count: rows.length, titles: rows.map((p) => p.title) };
+        }
+        if (settingsRes.error && isMissingTableMsg(settingsRes.error)) missingTables.push('site_settings');
+        if (profilesRes.error && isMissingTableMsg(profilesRes.error)) missingTables.push('profiles');
+        if (txRes.error && isMissingTableMsg(txRes.error)) missingTables.push('demo_transactions');
+        schemaReady = !plansRes.error && !(settingsRes.error && isMissingTableMsg(settingsRes.error));
+      }
+
       return jsonResponse({
         ok: true,
         mode: 'cloudflare-worker',
         runtime: 'cloudflare-worker',
+        supabaseConfigured: sb.publicReady,
+        adminApiReady: sb.adminReady,
+        schemaReady,
+        missingTables,
+        serviceKeyType: sb.serviceKeyType,
+        plansStatus,
         timestamp: new Date().toISOString(),
+      });
+    }
+
+    if (pathname === '/api/public/config' && method === 'GET') {
+      return jsonResponse({
+        supabaseConfigured: sb.publicReady,
+        supabaseUrl: sb.publicReady ? sb.url : '',
+        supabaseAnonKey: sb.publicReady ? sb.anonKey : '',
+        runtime: 'cloudflare-worker',
       });
     }
 
@@ -569,6 +798,31 @@ export default {
     // PUBLIC SITE DATA
     // =========================================================================
     if (pathname === '/api/public/site-data' && method === 'GET') {
+      if (sb.adminReady || sb.publicReady) {
+        const useService = sb.adminReady;
+        const [settingsRes, plansRes, annRes, bannersRes] = await Promise.all([
+          sbRest<WorkerSiteSettings[]>(sb, 'site_settings?select=*&id=eq.1&limit=1', { useService }),
+          sbRest<WorkerPlan[]>(sb, 'plans?select=*&order=sort_order.asc,created_at.desc', { useService }),
+          sbRest<WorkerAnnouncement[]>(sb, 'announcements?select=*&order=created_at.desc', { useService }),
+          sbRest<WorkerBanner[]>(sb, 'banners?select=*&order=sort_order.asc,created_at.desc', { useService }),
+        ]);
+
+        const sbSettings = !settingsRes.error && settingsRes.data && settingsRes.data[0] ? settingsRes.data[0] : null;
+        const sbPlans = !plansRes.error && plansRes.data && plansRes.data.length > 0 ? plansRes.data : null;
+        const sbAnn = !annRes.error && annRes.data && annRes.data.length > 0 ? annRes.data : null;
+        const sbBanners = !bannersRes.error && bannersRes.data && bannersRes.data.length > 0 ? bannersRes.data : null;
+
+        if (sbSettings || sbPlans || sbAnn || sbBanners) {
+          return jsonResponse({
+            siteSettings: sbSettings || state.siteSettings,
+            announcements: sbAnn || state.announcements,
+            plans: sbPlans || state.plans,
+            banners: sbBanners || state.banners,
+            runtime: 'cloudflare-worker',
+          });
+        }
+      }
+
       return jsonResponse({
         siteSettings: state.siteSettings,
         announcements: state.announcements,
@@ -597,6 +851,95 @@ export default {
       }
 
       const canonicalDigits = toCanonicalDigits(rawPhone);
+      const sbEmail = `u${canonicalDigits}@scania-member.com`;
+      const displayName = fullName || `সদস্য ${canonicalDigits.slice(-4)}`;
+
+      if (sb.adminReady) {
+        const dupRes = await sbRest<{ id: string }[]>(
+          sb,
+          `profiles?select=id&or=(email.eq.${encodeURIComponent(sbEmail)},phone.eq.${encodeURIComponent(rawPhone)},phone.eq.${encodeURIComponent(canonicalDigits)})&limit=1`,
+          { useService: true }
+        );
+        if (!dupRes.error && dupRes.data && dupRes.data.length > 0) {
+          return jsonResponse({ error: 'এই নম্বরটি ইতিমধ্যে নিবন্ধিত। অনুগ্রহ করে লগইন করুন।' }, 409);
+        }
+
+        const createRes = await fetch(`${sb.url}/auth/v1/admin/users`, {
+          method: 'POST',
+          headers: {
+            apikey: sb.serviceKey,
+            Authorization: `Bearer ${sb.serviceKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email: sbEmail,
+            password,
+            email_confirm: true,
+            user_metadata: {
+              full_name: displayName,
+              phone: rawPhone,
+              referral_code: referralCode,
+            },
+          }),
+        });
+        const createdJson = (await createRes.json().catch(() => ({}))) as {
+          id?: string;
+          user?: { id?: string };
+          msg?: string;
+          message?: string;
+        };
+
+        if (createRes.ok) {
+          const uid = createdJson.id || createdJson.user?.id;
+          if (uid) {
+            const profCheck = await sbRest<{ id: string }[]>(
+              sb,
+              `profiles?select=id&id=eq.${encodeURIComponent(uid)}&limit=1`,
+              { useService: true }
+            );
+            if (!profCheck.error && (!profCheck.data || profCheck.data.length === 0)) {
+              const scaniaId = `SCN${Math.floor(100000 + Math.random() * 900000)}`;
+              const refCode = `SCN${uid.replace(/-/g, '').slice(0, 6).toUpperCase()}`;
+              let referrerId: string | null = null;
+              if (referralCode) {
+                const refProf = await sbRest<{ id: string }[]>(
+                  sb,
+                  `profiles?select=id&referral_code=eq.${encodeURIComponent(referralCode)}&limit=1`,
+                  { useService: true }
+                );
+                referrerId = refProf.data?.[0]?.id ?? null;
+              }
+              await sbRest(sb, 'profiles', {
+                method: 'POST',
+                useService: true,
+                body: {
+                  id: uid,
+                  scania_id: scaniaId,
+                  email: sbEmail,
+                  full_name: displayName,
+                  phone: rawPhone,
+                  referral_code: refCode,
+                  referred_by: referrerId,
+                  demo_balance: 150,
+                  demo_bonus: 150,
+                },
+              });
+              await sbRest(sb, 'user_roles?on_conflict=user_id', {
+                method: 'POST',
+                useService: true,
+                prefer: 'resolution=ignore-duplicates',
+                body: { user_id: uid, role: 'user' },
+              });
+            }
+          }
+          return jsonResponse({ ok: true, mode: 'supabase', email: sbEmail });
+        } else {
+          const errMsg = (createdJson.msg || createdJson.message || '').toLowerCase();
+          if (errMsg.includes('already') || errMsg.includes('registered') || errMsg.includes('exists')) {
+            return jsonResponse({ error: 'এই নম্বরটি ইতিমধ্যে নিবন্ধিত। অনুগ্রহ করে লগইন করুন।' }, 409);
+          }
+        }
+      }
       const duplicate = state.members.find(
         (m) => m.canonical_digits === canonicalDigits || m.phone === rawPhone
       );
@@ -613,7 +956,6 @@ export default {
       const salt = randomHex(16);
       const hash = await sha256Hex(`${salt}:${password}`);
       const nowIso = new Date().toISOString();
-      const displayName = fullName || `সদস্য ${canonicalDigits.slice(-4)}`;
 
       const newMember: WorkerMemberRecord = {
         id: uid,
@@ -727,37 +1069,41 @@ export default {
           m.phone === rawPhone
       );
 
-      if (!member) {
-        return jsonResponse({ error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' }, 401);
-      }
-      if (!member.is_active) {
-        return jsonResponse({ error: 'অ্যাকাউন্টটি নিষ্ক্রিয় করা হয়েছে।' }, 403);
+      if (member) {
+        if (!member.is_active) {
+          return jsonResponse({ error: 'অ্যাকাউন্টটি নিষ্ক্রিয় করা হয়েছে।' }, 403);
+        }
+        const expected = await sha256Hex(`${member.password_salt}:${password}`);
+        if (expected !== member.password_hash) {
+          return jsonResponse({ error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' }, 401);
+        }
+
+        const token = await signWorkerToken(
+          {
+            uid: member.id,
+            role: 'user',
+            phone: member.phone,
+            name: member.full_name,
+            scania_id: member.scania_id,
+            ref_code: member.referral_code,
+          },
+          secret
+        );
+
+        return jsonResponse({
+          ok: true,
+          mode: 'server',
+          runtime: 'cloudflare-worker',
+          token,
+          profile: sanitizeMemberProfile(member),
+        });
       }
 
-      const expected = await sha256Hex(`${member.password_salt}:${password}`);
-      if (expected !== member.password_hash) {
-        return jsonResponse({ error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' }, 401);
+      if (sb.publicReady || sb.adminReady) {
+        return jsonResponse({ ok: false, trySupabase: true }, 404);
       }
 
-      const token = await signWorkerToken(
-        {
-          uid: member.id,
-          role: 'user',
-          phone: member.phone,
-          name: member.full_name,
-          scania_id: member.scania_id,
-          ref_code: member.referral_code,
-        },
-        secret
-      );
-
-      return jsonResponse({
-        ok: true,
-        mode: 'server',
-        runtime: 'cloudflare-worker',
-        token,
-        profile: sanitizeMemberProfile(member),
-      });
+      return jsonResponse({ error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' }, 401);
     }
 
     if (pathname === '/api/auth/prepare-login' && method === 'POST') {
@@ -766,7 +1112,20 @@ export default {
       if (!rawInput) return jsonResponse({ error: 'Phone number is required.' }, 400);
       if (rawInput.includes('@')) return jsonResponse({ email: rawInput });
       const canonical = toCanonicalDigits(rawInput);
-      return jsonResponse({ email: `u${canonical}@scania-member.com` });
+      const defaultEmail = `u${canonical}@scania-member.com`;
+
+      if (sb.adminReady) {
+        const profRes = await sbRest<{ id: string; email: string }[]>(
+          sb,
+          `profiles?select=id,email&or=(email.eq.${encodeURIComponent(defaultEmail)},phone.eq.${encodeURIComponent(rawInput)},phone.eq.${encodeURIComponent(canonical)})&limit=1`,
+          { useService: true }
+        );
+        const found = profRes.data?.[0];
+        if (found?.email) {
+          return jsonResponse({ email: found.email });
+        }
+      }
+      return jsonResponse({ email: defaultEmail });
     }
 
     if (pathname === '/api/auth/me' && method === 'GET') {
@@ -785,16 +1144,80 @@ export default {
     // =========================================================================
     // USER AUTHENTICATED ENDPOINTS
     // =========================================================================
-    const requireUserClaims = async () => {
+    const requireUserClaims = async (): Promise<(TokenClaims & { authMode?: 'worker' | 'supabase' }) | null> => {
       const token = getBearerToken(request);
       if (!token) return null;
-      return await verifyWorkerToken(token, secret);
+      const claims = await verifyWorkerToken(token, secret);
+      if (claims) return { ...claims, authMode: 'worker' };
+      if (sb.adminReady || sb.publicReady) {
+        const sbUser = await sbGetAuthUser(sb, token);
+        if (sbUser) {
+          return {
+            uid: sbUser.id,
+            role: 'user',
+            exp: Date.now() + 3600_000,
+            authMode: 'supabase',
+          };
+        }
+      }
+      return null;
     };
 
     if (pathname === '/api/user/state' && method === 'GET') {
       const claims = await requireUserClaims();
       if (!claims) return jsonResponse({ error: 'অনুগ্রহ করে প্রথমে লগইন করুন।' }, 401);
       const uid = claims.uid;
+
+      if (claims.authMode === 'supabase' && sb.adminReady && isUuid(uid)) {
+        const [profRes, txRes, prodRes, notifRes, refRes] = await Promise.all([
+          sbRest<any[]>(sb, `profiles?select=*&id=eq.${encodeURIComponent(uid)}&limit=1`, { useService: true }),
+          sbRest<any[]>(sb, `demo_transactions?select=*&user_id=eq.${encodeURIComponent(uid)}&order=created_at.desc`, {
+            useService: true,
+          }),
+          sbRest<any[]>(sb, `demo_user_products?select=*&user_id=eq.${encodeURIComponent(uid)}&order=started_at.desc`, {
+            useService: true,
+          }),
+          sbRest<any[]>(
+            sb,
+            `notifications?select=*&or=(user_id.eq.${encodeURIComponent(uid)},user_id.is.null)&order=created_at.desc&limit=50`,
+            { useService: true }
+          ),
+          sbRest<any[]>(sb, `referral_records?select=*&referrer_id=eq.${encodeURIComponent(uid)}&order=created_at.desc`, {
+            useService: true,
+          }),
+        ]);
+
+        if (!profRes.error && !txRes.error) {
+          const refRows = refRes.data || [];
+          const refIds = Array.from(new Set(refRows.map((r) => r.referred_user_id).filter(Boolean)));
+          let refMap = new Map<string, any>();
+          if (refIds.length > 0) {
+            const inList = refIds.map((id) => `"${id}"`).join(',');
+            const refProfRes = await sbRest<any[]>(
+              sb,
+              `profiles?select=id,full_name,scania_id,email,tier,created_at&id=in.(${encodeURIComponent(inList)})`,
+              { useService: true }
+            );
+            if (!refProfRes.error && refProfRes.data) {
+              refMap = new Map(refProfRes.data.map((p) => [p.id, p]));
+            }
+          }
+
+          return jsonResponse({
+            ok: true,
+            profile: profRes.data?.[0] || null,
+            bankCard: state.bankCards[uid] || null,
+            transactions: txRes.data || [],
+            userProducts: prodRes.data || [],
+            notifications: notifRes.data || [],
+            referrals: refRows.map((r) => ({
+              ...r,
+              referred: refMap.get(r.referred_user_id) || undefined,
+            })),
+          });
+        }
+      }
+
       const member = ensureMemberFromClaims(state, claims);
       const memberMap = new Map(state.members.map((m) => [m.id, m]));
 
@@ -861,6 +1284,21 @@ export default {
       const body = await readJsonBody(request);
       const notificationId = String(body.notificationId || '');
       if (!notificationId) return jsonResponse({ error: 'notificationId required' }, 400);
+
+      if (claims.authMode === 'supabase' && sb.adminReady && isUuid(notificationId) && isUuid(claims.uid)) {
+        await sbRest(
+          sb,
+          `notifications?id=eq.${encodeURIComponent(notificationId)}&user_id=eq.${encodeURIComponent(claims.uid)}`,
+          { method: 'PATCH', body: { is_read: true }, useService: true }
+        );
+        await sbRest(sb, 'notification_reads', {
+          method: 'POST',
+          body: { notification_id: notificationId, user_id: claims.uid },
+          prefer: 'resolution=merge-duplicates',
+          useService: true,
+        });
+      }
+
       state.notifications = state.notifications.map((n) =>
         n.id === notificationId && (n.user_id === claims.uid || n.user_id === null) ? { ...n, is_read: true } : n
       );
@@ -874,6 +1312,19 @@ export default {
       const body = await readJsonBody(request);
       const newPassword = String(body.newPassword || '');
       if (newPassword.length < 6) return jsonResponse({ error: 'পাসওয়ার্ড কমপক্ষে 6 অক্ষরের হতে হবে।' }, 400);
+      if (claims.authMode === 'supabase' && sb.adminReady) {
+        const authRes = await fetch(`${sb.url}/auth/v1/admin/users/${encodeURIComponent(claims.uid)}`, {
+          method: 'PUT',
+          headers: {
+            apikey: sb.serviceKey,
+            Authorization: `Bearer ${sb.serviceKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ password: newPassword }),
+        });
+        if (!authRes.ok) return jsonResponse({ error: 'পাসওয়ার্ড পরিবর্তন করা যায়নি।' }, 400);
+        return jsonResponse({ ok: true });
+      }
       const member = ensureMemberFromClaims(state, claims);
       const salt = randomHex(16);
       member.password_salt = salt;
@@ -887,9 +1338,6 @@ export default {
       const claims = await requireUserClaims();
       if (!claims) return jsonResponse({ error: 'অনুগ্রহ করে প্রথমে লগইন করুন।' }, 401);
       const uid = claims.uid;
-      const member = ensureMemberFromClaims(state, claims);
-      if (!member.is_active) return jsonResponse({ error: 'অ্যাকাউন্ট সক্রিয় নয়।' }, 403);
-
       const body = await readJsonBody(request);
       const type = String(body.type || '') as 'deposit_demo' | 'withdraw_demo';
       if (type !== 'deposit_demo' && type !== 'withdraw_demo') {
@@ -906,6 +1354,84 @@ export default {
       if (type === 'deposit_demo' && String(body.reference_code || '').trim().length < 4) {
         return jsonResponse({ error: 'অনুগ্রহ করে সঠিক লেনদেন আইডি (TrxID) লিখুন।' }, 400);
       }
+
+      if (claims.authMode === 'supabase' && sb.adminReady) {
+        const profRes = await sbRest<{ id: string; demo_balance: number; is_active: boolean }[]>(
+          sb,
+          `profiles?select=id,demo_balance,is_active&id=eq.${encodeURIComponent(uid)}&limit=1`,
+          { useService: true }
+        );
+        const prof = profRes.data?.[0];
+        if (!prof || !prof.is_active) {
+          return jsonResponse({ error: 'অ্যাকাউন্ট সক্রিয় নয় বা পাওয়া যায়নি।' }, 403);
+        }
+        const bankCard = state.bankCards[uid];
+        if (type === 'withdraw_demo') {
+          if (parsedAmount < 150) return jsonResponse({ error: 'সর্বনিম্ন উত্তোলন 150 টাকা।' }, 400);
+          if (!bankCard) {
+            return jsonResponse({ error: 'ব্যাংক কার্ড সেটআপ না থাকলে উত্তোলন করা যাবে না।' }, 400);
+          }
+          const prodRes = await sbRest<{ id: string }[]>(
+            sb,
+            `demo_user_products?select=id&user_id=eq.${encodeURIComponent(uid)}&limit=1`,
+            { useService: true }
+          );
+          if (!prodRes.data || prodRes.data.length === 0) {
+            return jsonResponse({ error: 'ডিপোজিট করার পরে কমপক্ষে 1 টি প্ল্যান না কিনলে উত্তোলন করা যাবে না।' }, 400);
+          }
+          if (Number(prof.demo_balance) < parsedAmount) {
+            return jsonResponse({ error: 'আপনার ব্যালেন্স পর্যাপ্ত নয়।' }, 400);
+          }
+        }
+
+        const fee = type === 'withdraw_demo' ? Number((parsedAmount * 0.05).toFixed(2)) : 0;
+        const net = Number((parsedAmount - fee).toFixed(2));
+        const txMethod =
+          type === 'withdraw_demo' && bankCard
+            ? `${bankCard.wallet_method} (${bankCard.wallet_number})`
+            : String(body.method || 'bKash').slice(0, 60);
+        const txNote =
+          type === 'deposit_demo'
+            ? 'আপনার পেমেন্টটি পর্যালোচনায় রয়েছে'
+            : `5% চার্জ: ৳${fee} · প্রাপ্তি: ৳${net}`;
+
+        const txInsert = await sbRest<WorkerTransaction[]>(sb, 'demo_transactions', {
+          method: 'POST',
+          useService: true,
+          prefer: 'return=representation',
+          body: {
+            user_id: uid,
+            type,
+            amount: Number(parsedAmount.toFixed(2)),
+            method: txMethod,
+            reference_code: String(body.reference_code || bankCard?.account_name || '').slice(0, 80),
+            status: 'pending',
+            admin_note: txNote,
+          },
+        });
+        if (txInsert.error) {
+          return jsonResponse({ error: txInsert.error }, 400);
+        }
+        const notifTitle =
+          type === 'deposit_demo' ? 'আপনার পেমেন্টটি পর্যালোচনায় রয়েছে' : 'আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে';
+        await sbRest(sb, 'notifications', {
+          method: 'POST',
+          useService: true,
+          body: {
+            user_id: uid,
+            title: notifTitle,
+            message:
+              type === 'deposit_demo'
+                ? `আপনার পেমেন্টটি পর্যালোচনায় রয়েছে (${parsedAmount} টাকা)।`
+                : `আপনার উত্তোলন আবেদন পর্যালোচনায় রয়েছে (${parsedAmount} টাকা · 5% চার্জ: ${fee} টাকা)।`,
+            category: 'transaction',
+          },
+        });
+        return jsonResponse({ transaction: txInsert.data?.[0], notificationTitle: notifTitle });
+      }
+
+      const member = ensureMemberFromClaims(state, claims);
+      if (!member.is_active) return jsonResponse({ error: 'অ্যাকাউন্ট সক্রিয় নয়।' }, 403);
       if (type === 'withdraw_demo') {
         if (parsedAmount < 150) return jsonResponse({ error: 'সর্বনিম্ন উত্তোলন 150 টাকা।' }, 400);
         if (!state.bankCards[uid]) {
@@ -979,6 +1505,72 @@ export default {
       const code = String(body.code || '').trim().toUpperCase();
       if (!code) return jsonResponse({ error: 'বোনাস কোড লিখুন।' }, 400);
 
+      if (claims.authMode === 'supabase' && sb.adminReady) {
+        const bonusRes = await sbRest<WorkerBonusCode[]>(
+          sb,
+          `bonus_codes?select=*&code=ilike.${encodeURIComponent(code)}&is_active=eq.true&limit=1`,
+          { useService: true }
+        );
+        const bonus = bonusRes.data?.[0];
+        if (!bonus) return jsonResponse({ error: 'বোনাস কোড পাওয়া যায়নি বা নিষ্ক্রিয়।' }, 404);
+        if (bonus.expires_at && new Date(bonus.expires_at) < new Date()) {
+          return jsonResponse({ error: 'বোনাস কোডের মেয়াদ শেষ হয়েছে।' }, 400);
+        }
+        if (bonus.used_count >= bonus.usage_limit) {
+          return jsonResponse({ error: 'বোনাস কোডের ব্যবহার সীমা শেষ।' }, 400);
+        }
+        const claimCheck = await sbRest<{ id: string }[]>(
+          sb,
+          `bonus_redemptions?select=id&bonus_code_id=eq.${encodeURIComponent(bonus.id)}&user_id=eq.${encodeURIComponent(claims.uid)}&limit=1`,
+          { useService: true }
+        );
+        if (claimCheck.data && claimCheck.data.length > 0) {
+          return jsonResponse({ error: 'আপনি ইতিমধ্যে এই বোনাস কোড ব্যবহার করেছেন।' }, 409);
+        }
+        const profRes = await sbRest<{ demo_balance: number; demo_bonus: number }[]>(
+          sb,
+          `profiles?select=demo_balance,demo_bonus&id=eq.${encodeURIComponent(claims.uid)}&limit=1`,
+          { useService: true }
+        );
+        const prof = profRes.data?.[0];
+        if (!prof) return jsonResponse({ error: 'Profile not found.' }, 404);
+        const amount = Number(bonus.bonus_amount);
+        const claimIns = await sbRest(sb, 'bonus_redemptions', {
+          method: 'POST',
+          useService: true,
+          body: { bonus_code_id: bonus.id, user_id: claims.uid, amount },
+        });
+        if (claimIns.error) return jsonResponse({ error: 'বোনাস কোড সংগ্রহ করা যায়নি।' }, 400);
+        await sbRest(sb, `bonus_codes?id=eq.${encodeURIComponent(bonus.id)}`, {
+          method: 'PATCH',
+          useService: true,
+          body: { used_count: bonus.used_count + 1 },
+        });
+        await sbRest(sb, `profiles?id=eq.${encodeURIComponent(claims.uid)}`, {
+          method: 'PATCH',
+          useService: true,
+          body: {
+            demo_balance: Number(prof.demo_balance) + amount,
+            demo_bonus: Number(prof.demo_bonus) + amount,
+            updated_at: new Date().toISOString(),
+          },
+        });
+        await sbRest(sb, 'demo_transactions', {
+          method: 'POST',
+          useService: true,
+          body: {
+            user_id: claims.uid,
+            type: 'bonus_code',
+            amount,
+            method: 'Bonus Code',
+            reference_code: bonus.code,
+            status: 'completed',
+            admin_note: 'বোনাস ক্রেডিট হয়েছে',
+          },
+        });
+        return jsonResponse({ success: true, amount });
+      }
+
       const bonusEntry = state.bonusCodes.find((b) => b.code.toUpperCase() === code && b.is_active);
       if (!bonusEntry) return jsonResponse({ error: 'বোনাস কোড পাওয়া যায়নি বা নিষ্ক্রিয়।' }, 404);
       if (bonusEntry.used_count >= bonusEntry.usage_limit) {
@@ -1018,6 +1610,64 @@ export default {
       if (!claims) return jsonResponse({ error: 'অনুগ্রহ করে প্রথমে লগইন করুন।' }, 401);
       const body = await readJsonBody(request);
       const planId = String(body.planId || '');
+
+      if (claims.authMode === 'supabase' && sb.adminReady && isUuid(planId)) {
+        const planRes = await sbRest<WorkerPlan[]>(
+          sb,
+          `plans?select=*&id=eq.${encodeURIComponent(planId)}&is_active=eq.true&limit=1`,
+          { useService: true }
+        );
+        const plan = planRes.data?.[0];
+        if (!plan) return jsonResponse({ error: 'প্ল্যানটি পাওয়া যায়নি।' }, 404);
+        const profRes = await sbRest<{ id: string; demo_balance: number; is_active: boolean; scania_id: string }[]>(
+          sb,
+          `profiles?select=id,demo_balance,is_active,scania_id&id=eq.${encodeURIComponent(claims.uid)}&limit=1`,
+          { useService: true }
+        );
+        const prof = profRes.data?.[0];
+        if (!prof || !prof.is_active) return jsonResponse({ error: 'অ্যাকাউন্ট সক্রিয় নয়।' }, 403);
+        const price = Number(plan.demo_price);
+        if (Number(prof.demo_balance) < price) {
+          return jsonResponse({ error: 'পর্যাপ্ত ব্যালেন্স নেই। অনুগ্রহ করে রিচার্জ করুন।' }, 400);
+        }
+        const nowIso = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + Number(plan.validity_days) * 86400000).toISOString();
+        await sbRest(sb, `profiles?id=eq.${encodeURIComponent(claims.uid)}`, {
+          method: 'PATCH',
+          useService: true,
+          body: { demo_balance: Number(prof.demo_balance) - price, updated_at: nowIso },
+        });
+        const prodRes = await sbRest<WorkerUserProduct[]>(sb, 'demo_user_products', {
+          method: 'POST',
+          useService: true,
+          prefer: 'return=representation',
+          body: {
+            user_id: claims.uid,
+            plan_id: plan.id,
+            plan_title: plan.title,
+            demo_price: price,
+            daily_income: Number(plan.daily_income),
+            validity_days: Number(plan.validity_days),
+            expires_at: expiresAt,
+          },
+        });
+        if (prodRes.error) return jsonResponse({ error: prodRes.error }, 400);
+        await sbRest(sb, 'demo_transactions', {
+          method: 'POST',
+          useService: true,
+          body: {
+            user_id: claims.uid,
+            type: 'plan_purchase',
+            amount: price,
+            method: 'ওয়ালেট',
+            reference_code: plan.title,
+            status: 'completed',
+            admin_note: `${plan.title} সক্রিয় হয়েছে`,
+          },
+        });
+        return jsonResponse({ success: true, product: prodRes.data?.[0] });
+      }
+
       const catalog = state.plans && state.plans.length > 0 ? state.plans : DEFAULT_PLANS;
       const plan = catalog.find((p) => p.id === planId && p.is_active);
       if (!plan) return jsonResponse({ error: 'প্ল্যানটি পাওয়া যায়নি।' }, 404);
@@ -1079,7 +1729,7 @@ export default {
         const token = await signWorkerToken({ uid: 'server-admin-1', role: 'super_admin' }, secret);
         return jsonResponse({
           ok: true,
-          mode: 'server',
+          mode: sb.adminReady ? 'hybrid' : 'server',
           token,
           profile: {
             id: 'server-admin-1',
@@ -1100,25 +1750,186 @@ export default {
           role: 'super_admin',
         });
       }
+
+      if (sb.adminReady && (sb.publicReady || sb.adminReady)) {
+        const authRes = await sbSignInPassword(sb, email, password);
+        if (authRes.user && authRes.access_token) {
+          const roleRes = await sbRest<{ role: string }[]>(
+            sb,
+            `user_roles?select=role&user_id=eq.${encodeURIComponent(authRes.user.id)}&limit=1`,
+            { useService: true }
+          );
+          const role = roleRes.data?.[0]?.role;
+          if (role && ['admin', 'super_admin'].includes(role)) {
+            const profRes = await sbRest<Record<string, unknown>[]>(
+              sb,
+              `profiles?select=*&id=eq.${encodeURIComponent(authRes.user.id)}&limit=1`,
+              { useService: true }
+            );
+            return jsonResponse({
+              ok: true,
+              mode: 'supabase',
+              token: authRes.access_token,
+              profile: profRes.data?.[0] || {
+                id: authRes.user.id,
+                scania_id: 'ADMIN01',
+                email,
+                full_name: 'Scania Administrator',
+                phone: '',
+                avatar_url: '',
+                tier: 'Admin',
+                demo_balance: 0,
+                demo_bonus: 0,
+                referral_code: 'ADMIN01',
+                referred_by: null,
+                is_active: true,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+              role,
+            });
+          }
+        }
+      }
+
       return jsonResponse({ error: 'Invalid admin credentials.' }, 401);
     }
 
-    const requireAdminClaims = async () => {
+    const requireAdminClaims = async (): Promise<{ uid: string; role: string; mode: 'worker' | 'supabase' } | null> => {
       const token = getBearerToken(request);
       if (!token) return null;
+
       const claims = await verifyWorkerToken(token, secret);
-      if (!claims || !['admin', 'super_admin'].includes(claims.role)) return null;
-      return claims;
+      if (claims && ['admin', 'super_admin'].includes(claims.role)) {
+        return { uid: claims.uid, role: claims.role, mode: 'worker' };
+      }
+
+      if (sb.adminReady) {
+        const authUser = await sbGetAuthUser(sb, token);
+        if (authUser) {
+          const roleRes = await sbRest<{ role: string }[]>(
+            sb,
+            `user_roles?select=role&user_id=eq.${encodeURIComponent(authUser.id)}&limit=1`,
+            { useService: true }
+          );
+          const role = roleRes.data?.[0]?.role;
+          if (role && ['admin', 'super_admin'].includes(role)) {
+            return { uid: authUser.id, role, mode: 'supabase' };
+          }
+        }
+      }
+      return null;
     };
 
     if (pathname === '/api/admin/state' && method === 'GET') {
       const admin = await requireAdminClaims();
       if (!admin) return jsonResponse({ error: 'Unauthorized' }, 401);
 
+      if (sb.adminReady) {
+        const [
+          profRes,
+          txRes,
+          prodRes,
+          refRes,
+          bonusRes,
+          annRes,
+          plansRes,
+          bannersRes,
+          settingsRes,
+          notifRes,
+          ticketsRes,
+          logsRes,
+        ] = await Promise.all([
+          sbRest<Record<string, unknown>[]>(sb, 'profiles?select=*&order=created_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'demo_transactions?select=*&order=created_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'demo_user_products?select=*&order=started_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'referral_records?select=*&order=created_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'bonus_codes?select=*&order=created_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'announcements?select=*&order=created_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'plans?select=*&order=sort_order.asc,created_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'banners?select=*&order=sort_order.asc,created_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'site_settings?select=*&id=eq.1&limit=1', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'notifications?select=*&order=created_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'support_tickets?select=*&order=updated_at.desc', { useService: true }),
+          sbRest<Record<string, unknown>[]>(sb, 'admin_audit_logs?select=*&order=created_at.desc&limit=50', { useService: true }),
+        ]);
+
+        const missingSchema =
+          (profRes.error && isMissingTableMsg(profRes.error)) ||
+          (txRes.error && isMissingTableMsg(txRes.error)) ||
+          (plansRes.error && isMissingTableMsg(plansRes.error));
+
+        if (!missingSchema && !profRes.error) {
+          const sbProfiles = profRes.data || [];
+          const profileMap = new Map(sbProfiles.map((p) => [String(p.id), p]));
+
+          const sbTransactions = (txRes.data || []).map((t) => {
+            const p = profileMap.get(String(t.user_id));
+            return {
+              ...t,
+              profiles: p ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email } : undefined,
+            };
+          });
+
+          const sbReferrals = (refRes.data || []).map((r) => {
+            const referred = profileMap.get(String(r.referred_user_id));
+            const referrer = profileMap.get(String(r.referrer_id));
+            return {
+              ...r,
+              referred: referred
+                ? {
+                    id: referred.id,
+                    full_name: referred.full_name,
+                    scania_id: referred.scania_id,
+                    email: referred.email,
+                    tier: referred.tier,
+                    created_at: referred.created_at,
+                  }
+                : undefined,
+              referrer: referrer
+                ? {
+                    id: referrer.id,
+                    full_name: referrer.full_name,
+                    scania_id: referrer.scania_id,
+                  }
+                : undefined,
+            };
+          });
+
+          const sbTickets = (ticketsRes.data || []).map((tk) => {
+            const p = profileMap.get(String(tk.user_id));
+            return {
+              ...tk,
+              profiles: p ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email } : undefined,
+            };
+          });
+
+          return jsonResponse({
+            ok: true,
+            mode: 'supabase',
+            schemaReady: true,
+            profiles: sbProfiles,
+            transactions: sbTransactions,
+            referrals: sbReferrals,
+            userProducts: prodRes.data || [],
+            bankCards: state.bankCards,
+            bonusCodes: bonusRes.data || [],
+            announcements: annRes.data || state.announcements,
+            plans: plansRes.data && plansRes.data.length > 0 ? plansRes.data : state.plans || DEFAULT_PLANS,
+            banners: bannersRes.data || state.banners,
+            siteSettings: settingsRes.data?.[0] || state.siteSettings,
+            notifications: notifRes.data || [],
+            supportTickets: sbTickets,
+            auditLogs: logsRes.data || [],
+          });
+        }
+      }
+
       const memberMap = new Map(state.members.map((m) => [m.id, m]));
       return jsonResponse({
         ok: true,
         mode: 'server',
+        schemaReady: false,
         profiles: state.members
           .map(sanitizeMemberProfile)
           .sort((a, b) => b.created_at.localeCompare(a.created_at)),
@@ -1144,6 +1955,7 @@ export default {
     }
 
     if (pathname === '/api/admin/site-settings' && method === 'POST') {
+      if (!(await requireAdminClaims())) return jsonResponse({ error: 'Unauthorized' }, 401);
       const body = await readJsonBody(request);
       const prev = state.siteSettings;
       const updated: WorkerSiteSettings = {
@@ -1166,6 +1978,16 @@ export default {
       };
       state.siteSettings = updated;
       await saveState(state);
+
+      if (sb.adminReady) {
+        await sbRest(sb, 'site_settings?on_conflict=id', {
+          method: 'POST',
+          useService: true,
+          prefer: 'resolution=merge-duplicates,return=representation',
+          body: updated,
+        });
+      }
+
       return jsonResponse({ ok: true, siteSettings: updated });
     }
 
@@ -1198,6 +2020,20 @@ export default {
         created_at: nowIso,
         updated_at: nowIso,
       };
+
+      if (sb.adminReady) {
+        const { id: _id, ...insertPayload } = newPlan;
+        const sbRes = await sbRest<WorkerPlan[]>(sb, 'plans', {
+          method: 'POST',
+          useService: true,
+          prefer: 'return=representation',
+          body: insertPayload,
+        });
+        if (!sbRes.error && sbRes.data?.[0]) {
+          return jsonResponse({ ok: true, plan: sbRes.data[0] });
+        }
+      }
+
       list.push(newPlan);
       state.plans = list;
       await saveState(state);
@@ -1207,15 +2043,47 @@ export default {
     if (pathname.startsWith('/api/admin/plans/') && (method === 'PUT' || method === 'DELETE')) {
       if (!(await requireAdminClaims())) return jsonResponse({ error: 'Unauthorized' }, 401);
       const planId = pathname.split('/').pop() || '';
-      const list = state.plans && state.plans.length > 0 ? [...state.plans] : [...DEFAULT_PLANS];
       if (method === 'DELETE') {
+        if (sb.adminReady && isUuid(planId)) {
+          await sbRest(sb, `plans?id=eq.${encodeURIComponent(planId)}`, {
+            method: 'DELETE',
+            useService: true,
+          });
+        }
+        const list = state.plans && state.plans.length > 0 ? [...state.plans] : [...DEFAULT_PLANS];
         state.plans = list.filter((p) => p.id !== planId);
         await saveState(state);
         return jsonResponse({ ok: true });
       }
+      const body = await readJsonBody(request);
+      if (sb.adminReady && isUuid(planId)) {
+        const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+        if (body.title !== undefined) patch.title = String(body.title).trim().slice(0, 100);
+        if (body.subtitle !== undefined) patch.subtitle = String(body.subtitle).trim().slice(0, 100);
+        if (body.description !== undefined) patch.description = String(body.description).trim().slice(0, 500);
+        if (body.image_url !== undefined) patch.image_url = String(body.image_url).trim().slice(0, 500);
+        if (body.demo_price !== undefined) patch.demo_price = Number(body.demo_price);
+        if (body.daily_income !== undefined) patch.daily_income = Number(body.daily_income);
+        if (body.validity_days !== undefined) patch.validity_days = Number(body.validity_days);
+        if (body.total_return !== undefined) patch.total_return = body.total_return ? Number(body.total_return) : null;
+        if (body.badge !== undefined) patch.badge = String(body.badge).trim().slice(0, 30);
+        if (typeof body.is_active === 'boolean') patch.is_active = body.is_active;
+        if (body.sort_order !== undefined) patch.sort_order = Number(body.sort_order);
+
+        const sbRes = await sbRest<WorkerPlan[]>(sb, `plans?id=eq.${encodeURIComponent(planId)}`, {
+          method: 'PATCH',
+          useService: true,
+          prefer: 'return=representation',
+          body: patch,
+        });
+        if (!sbRes.error && sbRes.data?.[0]) {
+          return jsonResponse({ ok: true, plan: sbRes.data[0] });
+        }
+      }
+
+      const list = state.plans && state.plans.length > 0 ? [...state.plans] : [...DEFAULT_PLANS];
       const idx = list.findIndex((p) => p.id === planId);
       if (idx === -1) return jsonResponse({ error: 'Plan not found.' }, 404);
-      const body = await readJsonBody(request);
       const cur = list[idx];
       list[idx] = {
         ...cur,
@@ -1253,6 +2121,20 @@ export default {
         expires_at: null,
         created_at: new Date().toISOString(),
       };
+
+      if (sb.adminReady) {
+        const { id: _id, ...insertPayload } = created;
+        const sbRes = await sbRest<WorkerBonusCode[]>(sb, 'bonus_codes', {
+          method: 'POST',
+          useService: true,
+          prefer: 'return=representation',
+          body: insertPayload,
+        });
+        if (!sbRes.error && sbRes.data?.[0]) {
+          return jsonResponse({ ok: true, bonusCode: sbRes.data[0] });
+        }
+      }
+
       state.bonusCodes.unshift(created);
       await saveState(state);
       return jsonResponse({ ok: true, bonusCode: created });
@@ -1262,13 +2144,34 @@ export default {
       if (!(await requireAdminClaims())) return jsonResponse({ error: 'Unauthorized' }, 401);
       const id = pathname.split('/').pop() || '';
       if (method === 'DELETE') {
+        if (sb.adminReady && isUuid(id)) {
+          await sbRest(sb, `bonus_codes?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+        }
         state.bonusCodes = state.bonusCodes.filter((b) => b.id !== id);
         await saveState(state);
         return jsonResponse({ ok: true });
       }
+      const body = await readJsonBody(request);
+      if (sb.adminReady && isUuid(id)) {
+        const patch: Record<string, unknown> = {};
+        if (body.code !== undefined) patch.code = String(body.code).trim().toUpperCase();
+        if (body.description !== undefined) patch.description = String(body.description).trim();
+        if (body.bonus_amount !== undefined) patch.bonus_amount = Number(body.bonus_amount);
+        if (body.usage_limit !== undefined) patch.usage_limit = Number(body.usage_limit);
+        if (typeof body.is_active === 'boolean') patch.is_active = body.is_active;
+        const sbRes = await sbRest<WorkerBonusCode[]>(sb, `bonus_codes?id=eq.${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          useService: true,
+          prefer: 'return=representation',
+          body: patch,
+        });
+        if (!sbRes.error && sbRes.data?.[0]) {
+          return jsonResponse({ ok: true, bonusCode: sbRes.data[0] });
+        }
+      }
+
       const idx = state.bonusCodes.findIndex((b) => b.id === id);
       if (idx === -1) return jsonResponse({ error: 'Bonus code not found.' }, 404);
-      const body = await readJsonBody(request);
       const cur = state.bonusCodes[idx];
       state.bonusCodes[idx] = {
         ...cur,
@@ -1296,6 +2199,20 @@ export default {
         created_at: nowIso,
         updated_at: nowIso,
       };
+
+      if (sb.adminReady) {
+        const { id: _id, ...insertPayload } = created;
+        const sbRes = await sbRest<WorkerAnnouncement[]>(sb, 'announcements', {
+          method: 'POST',
+          useService: true,
+          prefer: 'return=representation',
+          body: insertPayload,
+        });
+        if (!sbRes.error && sbRes.data?.[0]) {
+          return jsonResponse({ ok: true, announcement: sbRes.data[0] });
+        }
+      }
+
       list.unshift(created);
       state.announcements = list;
       await saveState(state);
@@ -1306,14 +2223,34 @@ export default {
       if (!(await requireAdminClaims())) return jsonResponse({ error: 'Unauthorized' }, 401);
       const id = pathname.split('/').pop() || '';
       if (method === 'DELETE') {
+        if (sb.adminReady && isUuid(id)) {
+          await sbRest(sb, `announcements?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+        }
         state.announcements = (state.announcements || []).filter((a) => a.id !== id);
         await saveState(state);
         return jsonResponse({ ok: true });
       }
+      const body = await readJsonBody(request);
+      if (sb.adminReady && isUuid(id)) {
+        const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+        if (body.title !== undefined) patch.title = String(body.title).trim().slice(0, 140);
+        if (body.content !== undefined) patch.content = String(body.content).trim().slice(0, 1000);
+        if (body.priority !== undefined) patch.priority = body.priority === 'important' ? 'important' : 'normal';
+        if (typeof body.is_published === 'boolean') patch.is_published = body.is_published;
+        const sbRes = await sbRest<WorkerAnnouncement[]>(sb, `announcements?id=eq.${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          useService: true,
+          prefer: 'return=representation',
+          body: patch,
+        });
+        if (!sbRes.error && sbRes.data?.[0]) {
+          return jsonResponse({ ok: true, announcement: sbRes.data[0] });
+        }
+      }
+
       const list = state.announcements ? [...state.announcements] : [];
       const idx = list.findIndex((a) => a.id === id);
       if (idx === -1) return jsonResponse({ error: 'Announcement not found.' }, 404);
-      const body = await readJsonBody(request);
       const cur = list[idx];
       list[idx] = {
         ...cur,
@@ -1339,6 +2276,15 @@ export default {
       const userIds = Array.isArray(body.userIds) ? body.userIds : [];
       const nowIso = new Date().toISOString();
       if (!title || !message) return jsonResponse({ error: 'Title and message are required.' }, 400);
+
+      if (sb.adminReady) {
+        const rows =
+          userIds.length === 0
+            ? [{ user_id: null, title, message, category }]
+            : userIds.map((uid) => ({ user_id: String(uid), title, message, category }));
+        const sbRes = await sbRest(sb, 'notifications', { method: 'POST', useService: true, body: rows });
+        if (!sbRes.error) return jsonResponse({ ok: true });
+      }
 
       if (userIds.length === 0) {
         state.notifications.unshift({
@@ -1387,6 +2333,20 @@ export default {
         sort_order: state.banners.length + 1,
         created_at: new Date().toISOString(),
       };
+
+      if (sb.adminReady) {
+        const { id: _id, ...insertPayload } = created;
+        const sbRes = await sbRest<WorkerBanner[]>(sb, 'banners', {
+          method: 'POST',
+          useService: true,
+          prefer: 'return=representation',
+          body: insertPayload,
+        });
+        if (!sbRes.error && sbRes.data?.[0]) {
+          return jsonResponse({ ok: true, banner: sbRes.data[0] });
+        }
+      }
+
       state.banners.push(created);
       await saveState(state);
       return jsonResponse({ ok: true, banner: created });
@@ -1395,6 +2355,9 @@ export default {
     if (pathname.startsWith('/api/admin/banners/') && method === 'DELETE') {
       if (!(await requireAdminClaims())) return jsonResponse({ error: 'Unauthorized' }, 401);
       const id = pathname.split('/').pop() || '';
+      if (sb.adminReady && isUuid(id)) {
+        await sbRest(sb, `banners?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+      }
       state.banners = state.banners.filter((b) => b.id !== id);
       await saveState(state);
       return jsonResponse({ ok: true });
@@ -1409,6 +2372,117 @@ export default {
       const adminNote = body.adminNote ? String(body.adminNote) : '';
       if (!transactionId || !decision) {
         return jsonResponse({ error: 'Valid transactionId and decision required.' }, 400);
+      }
+
+      if (sb.adminReady && isUuid(transactionId)) {
+        const txRes = await sbRest<WorkerTransaction[]>(
+          sb,
+          `demo_transactions?select=*&id=eq.${encodeURIComponent(transactionId)}&limit=1`,
+          { useService: true }
+        );
+        const sbTx = txRes.data?.[0];
+        if (sbTx) {
+          if (sbTx.status !== 'pending') {
+            return jsonResponse({ error: 'Transaction has already been processed.' }, 400);
+          }
+          const nowIso = new Date().toISOString();
+          const txAmount = Number(sbTx.amount);
+
+          if (decision === 'approved') {
+            const profRes = await sbRest<{ id: string; demo_balance: number; referred_by: string | null; full_name: string; scania_id: string }[]>(
+              sb,
+              `profiles?select=id,demo_balance,referred_by,full_name,scania_id&id=eq.${encodeURIComponent(sbTx.user_id)}&limit=1`,
+              { useService: true }
+            );
+            const prof = profRes.data?.[0];
+            if (!prof) return jsonResponse({ error: 'User profile not found.' }, 404);
+            const currentBal = Number(prof.demo_balance || 0);
+
+            if (sbTx.type === 'deposit_demo') {
+              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
+                method: 'PATCH',
+                useService: true,
+                body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
+              });
+              if (prof.referred_by) {
+                const comm = Number((txAmount * 0.25).toFixed(2));
+                const refProfRes = await sbRest<{ id: string; demo_balance: number }[]>(
+                  sb,
+                  `profiles?select=id,demo_balance&id=eq.${encodeURIComponent(prof.referred_by)}&limit=1`,
+                  { useService: true }
+                );
+                const refProf = refProfRes.data?.[0];
+                if (refProf && comm > 0) {
+                  await sbRest(sb, `profiles?id=eq.${encodeURIComponent(refProf.id)}`, {
+                    method: 'PATCH',
+                    useService: true,
+                    body: { demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)), updated_at: nowIso },
+                  });
+                  await sbRest(sb, 'demo_transactions', {
+                    method: 'POST',
+                    useService: true,
+                    body: {
+                      user_id: refProf.id,
+                      type: 'referral_commission',
+                      amount: comm,
+                      method: 'লেভেল 1 রেফারেল (25%)',
+                      reference_code: prof.scania_id,
+                      status: 'completed',
+                      admin_note: 'ডিপোজিট কনফার্ম কমিশন যুক্ত হয়েছে',
+                    },
+                  });
+                }
+              }
+            } else if (sbTx.type === 'withdraw_demo') {
+              if (currentBal < txAmount) {
+                return jsonResponse({ error: 'User balance is lower than withdrawal request amount.' }, 400);
+              }
+              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
+                method: 'PATCH',
+                useService: true,
+                body: { demo_balance: Number((currentBal - txAmount).toFixed(2)), updated_at: nowIso },
+              });
+            }
+          }
+
+          const updRes = await sbRest<WorkerTransaction[]>(
+            sb,
+            `demo_transactions?id=eq.${encodeURIComponent(transactionId)}`,
+            {
+              method: 'PATCH',
+              useService: true,
+              prefer: 'return=representation',
+              body: {
+                status: decision,
+                admin_note: adminNote.slice(0, 300),
+                processed_by: isUuid(admin.uid) ? admin.uid : null,
+                updated_at: nowIso,
+              },
+            }
+          );
+
+          const title =
+            decision === 'approved'
+              ? sbTx.type === 'deposit_demo'
+                ? 'আপনার রিচার্জ সফল হয়েছে'
+                : 'আপনার উত্তোলন সফল হয়েছে'
+              : sbTx.type === 'deposit_demo'
+              ? 'আপনার রিচার্জ ব্যর্থ হয়েছে'
+              : 'আপনার উত্তোলন ব্যর্থ হয়েছে';
+
+          await sbRest(sb, 'notifications', {
+            method: 'POST',
+            useService: true,
+            body: {
+              user_id: sbTx.user_id,
+              title,
+              message: `${title} (${txAmount} টাকা)।${adminNote ? ` নোট: ${adminNote}` : ''}`,
+              category: 'transaction',
+            },
+          });
+
+          return jsonResponse({ ok: true, transaction: updRes.data?.[0] || sbTx });
+        }
       }
 
       const txIdx = state.transactions.findIndex((t) => t.id === transactionId);
@@ -1475,10 +2549,163 @@ export default {
       if (!admin) return jsonResponse({ error: 'Unauthorized' }, 401);
       const targetId = userActionMatch[1];
       const action = userActionMatch[2] || '';
-      const mIdx = state.members.findIndex((m) => m.id === targetId);
-      if (mIdx === -1) return jsonResponse({ error: 'User not found.' }, 404);
       const body = await readJsonBody(request);
       const nowIso = new Date().toISOString();
+
+      if (sb.adminReady && isUuid(targetId)) {
+        if (!action && method === 'PUT') {
+          const patch: Record<string, unknown> = { updated_at: nowIso };
+          if (typeof body.full_name === 'string' && body.full_name.trim()) patch.full_name = body.full_name.trim().slice(0, 80);
+          if (typeof body.phone === 'string') patch.phone = body.phone.trim().slice(0, 30);
+          if (typeof body.tier === 'string' && body.tier.trim()) patch.tier = body.tier.trim().slice(0, 40);
+          if (typeof body.is_active === 'boolean') patch.is_active = body.is_active;
+          const updRes = await sbRest<Record<string, unknown>[]>(
+            sb,
+            `profiles?id=eq.${encodeURIComponent(targetId)}`,
+            { method: 'PATCH', useService: true, prefer: 'return=representation', body: patch }
+          );
+          if (!updRes.error && updRes.data?.[0]) {
+            return jsonResponse({ ok: true, profile: updRes.data[0] });
+          }
+        }
+
+        if (action === 'balance' && method === 'POST') {
+          const mode = body.mode === 'deduct' ? 'deduct' : 'add';
+          const amount = Number(body.amount || 0);
+          const note = String(body.note || '').trim().slice(0, 200);
+          if (!Number.isFinite(amount) || amount <= 0 || amount > 10000000) {
+            return jsonResponse({ error: 'সঠিক টাকার পরিমাণ লিখুন।' }, 400);
+          }
+          const profRes = await sbRest<{ demo_balance: number }[]>(
+            sb,
+            `profiles?select=demo_balance&id=eq.${encodeURIComponent(targetId)}&limit=1`,
+            { useService: true }
+          );
+          const prof = profRes.data?.[0];
+          if (prof) {
+            const cur = Number(prof.demo_balance || 0);
+            if (mode === 'deduct' && cur < amount) {
+              return jsonResponse({ error: 'ব্যবহারকারীর ব্যালেন্সের চেয়ে বেশি টাকা কাটা যাবে না।' }, 400);
+            }
+            const nextBal = mode === 'add' ? Number((cur + amount).toFixed(2)) : Number((cur - amount).toFixed(2));
+            const updRes = await sbRest<Record<string, unknown>[]>(
+              sb,
+              `profiles?id=eq.${encodeURIComponent(targetId)}`,
+              { method: 'PATCH', useService: true, prefer: 'return=representation', body: { demo_balance: nextBal, updated_at: nowIso } }
+            );
+            await sbRest(sb, 'demo_transactions', {
+              method: 'POST',
+              useService: true,
+              body: {
+                user_id: targetId,
+                type: mode === 'add' ? 'bonus_code' : 'withdraw_demo',
+                amount: Number(amount.toFixed(2)),
+                method: mode === 'add' ? 'Admin Add Balance' : 'Admin Deduct Balance',
+                reference_code: 'ADMIN-ADJ',
+                status: 'completed',
+                admin_note: note || (mode === 'add' ? 'অ্যাডমিন থেকে ব্যালেন্স যোগ করা হয়েছে' : 'অ্যাডমিন থেকে ব্যালেন্স কাটা হয়েছে'),
+                processed_by: isUuid(admin.uid) ? admin.uid : null,
+              },
+            });
+            await sbRest(sb, 'notifications', {
+              method: 'POST',
+              useService: true,
+              body: {
+                user_id: targetId,
+                title: mode === 'add' ? 'ব্যালেন্স যোগ হয়েছে' : 'ব্যালেন্স সমন্বয় হয়েছে',
+                message:
+                  mode === 'add'
+                    ? `আপনার অ্যাকাউন্টে ${amount} টাকা যোগ করা হয়েছে।${note ? ` (${note})` : ''}`
+                    : `আপনার অ্যাকাউন্ট থেকে ${amount} টাকা কেটে নেওয়া হয়েছে।${note ? ` (${note})` : ''}`,
+                category: 'transaction',
+              },
+            });
+            return jsonResponse({ ok: true, profile: updRes.data?.[0] });
+          }
+        }
+
+        if (action === 'password' && method === 'POST') {
+          const newPassword = String(body.newPassword || '');
+          if (newPassword.length < 6) {
+            return jsonResponse({ error: 'নতুন পাসওয়ার্ড কমপক্ষে 6 অক্ষরের হতে হবে।' }, 400);
+          }
+          const authRes = await fetch(`${sb.url}/auth/v1/admin/users/${encodeURIComponent(targetId)}`, {
+            method: 'PUT',
+            headers: {
+              apikey: sb.serviceKey,
+              Authorization: `Bearer ${sb.serviceKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ password: newPassword }),
+          });
+          if (authRes.ok) {
+            return jsonResponse({ ok: true });
+          }
+        }
+
+        if (action === 'assign-plan' && method === 'POST') {
+          const planId = String(body.planId || '');
+          const tier = typeof body.tier === 'string' && body.tier.trim() ? body.tier.trim().slice(0, 40) : '';
+          const planRes = await sbRest<WorkerPlan[]>(
+            sb,
+            `plans?select=*&id=eq.${encodeURIComponent(planId)}&limit=1`,
+            { useService: true }
+          );
+          const plan = planRes.data?.[0];
+          if (plan) {
+            if (tier) {
+              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(targetId)}`, {
+                method: 'PATCH',
+                useService: true,
+                body: { tier, updated_at: nowIso },
+              });
+            }
+            const expiresAt = new Date(Date.now() + Number(plan.validity_days) * 86400000).toISOString();
+            const prodRes = await sbRest<WorkerUserProduct[]>(sb, 'demo_user_products', {
+              method: 'POST',
+              useService: true,
+              prefer: 'return=representation',
+              body: {
+                user_id: targetId,
+                plan_id: plan.id,
+                plan_title: plan.title,
+                demo_price: Number(plan.demo_price),
+                daily_income: Number(plan.daily_income),
+                validity_days: Number(plan.validity_days),
+                expires_at: expiresAt,
+              },
+            });
+            await sbRest(sb, 'demo_transactions', {
+              method: 'POST',
+              useService: true,
+              body: {
+                user_id: targetId,
+                type: 'plan_purchase',
+                amount: Number(plan.demo_price),
+                method: 'Admin VIP Assign',
+                reference_code: plan.title,
+                status: 'completed',
+                admin_note: `অ্যাডমিন থেকে ${plan.title} VIP প্যাকেজ যুক্ত হয়েছে`,
+                processed_by: isUuid(admin.uid) ? admin.uid : null,
+              },
+            });
+            await sbRest(sb, 'notifications', {
+              method: 'POST',
+              useService: true,
+              body: {
+                user_id: targetId,
+                title: 'অ্যাডমিন থেকে নতুন VIP প্ল্যান যুক্ত হয়েছে',
+                message: `আপনার অ্যাকাউন্টে "${plan.title}" প্ল্যানটি সফলভাবে যুক্ত করা হয়েছে।`,
+                category: 'system',
+              },
+            });
+            return jsonResponse({ ok: true, product: prodRes.data?.[0] });
+          }
+        }
+      }
+
+      const mIdx = state.members.findIndex((m) => m.id === targetId);
+      if (mIdx === -1) return jsonResponse({ error: 'User not found.' }, 404);
 
       if (!action && method === 'PUT') {
         if (typeof body.full_name === 'string' && body.full_name.trim()) {

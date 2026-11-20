@@ -3,7 +3,7 @@ import { Image, Plus, Trash2, Upload, X } from 'lucide-react';
 import { ScaniaImage } from '../../components/ScaniaVisuals';
 import { useAuth } from '../../contexts/AuthContext';
 import { usePlatformData } from '../../contexts/PlatformDataContext';
-import { callApiWithFallback, supabase } from '../../lib/supabase';
+import { callApiWithFallback, getStoredAdminToken, supabase } from '../../lib/supabase';
 import { Banner, BannerPlacement } from '../../types/database';
 import { ConfirmModal, EmptyState, useToast } from '../../components/ui/Feedback';
 
@@ -26,8 +26,7 @@ export const BannersImagesView: React.FC = () => {
   const [logoUrl, setLogoUrl] = useState(siteSettings.logo_url || '');
 
   const hasAdminAccess = () => {
-    const hasAdminToken =
-      typeof window !== 'undefined' && Boolean(window.sessionStorage.getItem('scania_admin_token'));
+    const hasAdminToken = Boolean(getStoredAdminToken());
     return hasAdminToken || (!isPreviewMode && Boolean(supabase && user));
   };
 

@@ -4,6 +4,7 @@ import {
   clearStoredTokens,
   getStoredAdminToken,
   getStoredServerToken,
+  hydrateRuntimeSupabaseConfig,
   isSupabaseConfigured,
   setStoredAdminToken,
   setStoredServerToken,
@@ -84,6 +85,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [profile, setProfile] = useState<Profile | null>(null);
   const [role, setRole] = useState<AppRole | null>(null);
   const [loading, setLoading] = useState(true);
+  const [supabaseReady, setSupabaseReady] = useState(isSupabaseConfigured);
   const [justLoggedIn, setJustLoggedIn] = useState(false);
 
   const clearJustLoggedIn = useCallback(() => setJustLoggedIn(false), []);
@@ -152,84 +154,96 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [session?.user?.id, loadUserDetails, applyServerAuthSession]);
 
   useEffect(() => {
-    if (!isSupabaseConfigured || !supabase) {
-      if (typeof window !== 'undefined') {
-        const adminToken = getStoredAdminToken();
-        if (adminToken && window.location.pathname.startsWith('/admin')) {
-          applyServerAuthSession(
-            {
-              id: 'server-admin-1',
-              scania_id: 'ADMIN01',
-              email: 'admin@scania.com',
-              full_name: 'Scania Administrator',
-              phone: '',
-              avatar_url: '',
-              tier: 'Admin',
-              demo_balance: 0,
-              demo_bonus: 0,
-              referral_code: 'ADMIN01',
-              referred_by: null,
-              is_active: true,
-              created_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-            },
-            undefined,
-            'super_admin'
-          );
-          setLoading(false);
-          return;
+    let mounted = true;
+    let authSubscription: { unsubscribe: () => void } | null = null;
+
+    const bootstrapAuth = async () => {
+      if (!isSupabaseConfigured || !supabase) {
+        const hydrated = await hydrateRuntimeSupabaseConfig();
+        if (!mounted) return;
+        if (hydrated) {
+          setSupabaseReady(true);
         }
-        const serverToken = getStoredServerToken();
-        if (serverToken) {
-          if (serverToken.startsWith('local:')) {
-            const localProf = localGetMemberByToken(serverToken);
-            if (localProf) {
-              applyServerAuthSession(localProf);
+      } else {
+        setSupabaseReady(true);
+      }
+
+      if (!isSupabaseConfigured || !supabase) {
+        if (typeof window !== 'undefined') {
+          const adminToken = getStoredAdminToken();
+          if (adminToken && window.location.pathname.startsWith('/admin')) {
+            applyServerAuthSession(
+              {
+                id: 'server-admin-1',
+                scania_id: 'ADMIN01',
+                email: 'admin@scania.com',
+                full_name: 'Scania Administrator',
+                phone: '',
+                avatar_url: '',
+                tier: 'Admin',
+                demo_balance: 0,
+                demo_bonus: 0,
+                referral_code: 'ADMIN01',
+                referred_by: null,
+                is_active: true,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+              undefined,
+              'super_admin'
+            );
+            setLoading(false);
+            return;
+          }
+          const serverToken = getStoredServerToken();
+          if (serverToken) {
+            if (serverToken.startsWith('local:')) {
+              const localProf = localGetMemberByToken(serverToken);
+              if (localProf) {
+                applyServerAuthSession(localProf);
+                setLoading(false);
+                return;
+              }
+            }
+            try {
+              const r = await fetch('/api/auth/me', { headers: { Authorization: `Bearer ${serverToken}` } });
+              if (!mounted) return;
+              if (r.ok) {
+                const srvData = (await r.json()) as { profile?: Profile };
+                if (srvData?.profile) {
+                  applyServerAuthSession(srvData.profile);
+                  setLoading(false);
+                  return;
+                }
+              } else if (r.status === 401 || r.status === 403) {
+                setStoredServerToken(null);
+              }
+            } catch {
+              // Keep cached profile if network unavailable
+            }
+            const cached = localGetMemberByToken(`local:${serverToken}`) || null;
+            if (cached) {
+              applyServerAuthSession(cached);
               setLoading(false);
               return;
             }
           }
-          fetch('/api/auth/me', { headers: { Authorization: `Bearer ${serverToken}` } })
-            .then((r) => (r.ok ? r.json() : null))
-            .then((srvData: { profile?: Profile } | null) => {
-              if (srvData?.profile) {
-                applyServerAuthSession(srvData.profile);
-              } else {
-                const cached = localGetMemberByToken(`local:${serverToken}`) || null;
-                if (cached) {
-                  applyServerAuthSession(cached);
-                } else {
-                  setProfile({ ...PREVIEW_USER_PROFILE, full_name: 'Naymhasam', tier: 'Diamond' });
-                  setRole('user');
-                }
-              }
-              setLoading(false);
-            })
-            .catch(() => {
-              setProfile({ ...PREVIEW_USER_PROFILE, full_name: 'Naymhasam', tier: 'Diamond' });
-              setRole('user');
-              setLoading(false);
-            });
-          return;
         }
+        const signedOut =
+          typeof window !== 'undefined' && window.localStorage.getItem(SIGNED_OUT_FLAG_KEY) === '1';
+        if (!signedOut && typeof window !== 'undefined' && !window.location.pathname.startsWith('/admin')) {
+          setProfile({
+            ...PREVIEW_USER_PROFILE,
+            full_name: 'Naymhasam',
+            tier: 'Diamond',
+          });
+          setRole('user');
+        }
+        if (mounted) setLoading(false);
+        return;
       }
-      const signedOut =
-        typeof window !== 'undefined' && window.localStorage.getItem(SIGNED_OUT_FLAG_KEY) === '1';
-      if (!signedOut) {
-        setProfile({
-          ...PREVIEW_USER_PROFILE,
-          full_name: 'Naymhasam',
-          tier: 'Diamond',
-        });
-        setRole('user');
-      }
-      setLoading(false);
-      return;
-    }
 
-    let mounted = true;
-    const initAuth = async () => {
-      const { data } = await supabase!.auth.getSession();
+      const { data } = await supabase.auth.getSession();
       if (!mounted) return;
 
       if (data.session?.user) {
@@ -237,45 +251,51 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setUser(data.session.user);
         await loadUserDetails(data.session.user.id);
         if (mounted) setLoading(false);
-        return;
-      }
-
-      // Restore server-issued admin or member session if present
-      if (typeof window !== 'undefined') {
+      } else if (typeof window !== 'undefined') {
         const adminToken = getStoredAdminToken();
         if (adminToken && window.location.pathname.startsWith('/admin')) {
+          let adminRestored = false;
           try {
             const adminRes = await fetch('/api/admin/state', {
               headers: { Authorization: `Bearer ${adminToken}` },
+              cache: 'no-store',
             });
             if (adminRes.ok && mounted) {
-              applyServerAuthSession(
-                {
-                  id: 'server-admin-1',
-                  scania_id: 'ADMIN01',
-                  email: 'admin@scania.com',
-                  full_name: 'Scania Administrator',
-                  phone: '',
-                  avatar_url: '',
-                  tier: 'Admin',
-                  demo_balance: 0,
-                  demo_bonus: 0,
-                  referral_code: 'ADMIN01',
-                  referred_by: null,
-                  is_active: true,
-                  created_at: new Date().toISOString(),
-                  updated_at: new Date().toISOString(),
-                },
-                undefined,
-                'super_admin'
-              );
-              setLoading(false);
-              return;
-            } else {
+              adminRestored = true;
+            } else if (adminRes.status === 401 || adminRes.status === 403) {
               setStoredAdminToken(null);
+            } else {
+              // Keep admin session on transient 5xx errors
+              adminRestored = true;
             }
           } catch {
-            // Ignore network error
+            // Keep admin session on transient network failure
+            adminRestored = true;
+          }
+
+          if (adminRestored && mounted) {
+            applyServerAuthSession(
+              {
+                id: 'server-admin-1',
+                scania_id: 'ADMIN01',
+                email: 'admin@scania.com',
+                full_name: 'Scania Administrator',
+                phone: '',
+                avatar_url: '',
+                tier: 'Admin',
+                demo_balance: 0,
+                demo_bonus: 0,
+                referral_code: 'ADMIN01',
+                referred_by: null,
+                is_active: true,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              },
+              undefined,
+              'super_admin'
+            );
+            setLoading(false);
+            return;
           }
         }
 
@@ -289,10 +309,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               const srvData = (await res.json()) as { profile?: Profile };
               if (mounted && srvData.profile) {
                 applyServerAuthSession(srvData.profile);
-                setLoading(false);
-                return;
               }
-            } else {
+            } else if (res.status === 401 || res.status === 403) {
               setStoredServerToken(null);
             }
           } catch {
@@ -302,34 +320,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       if (mounted) setLoading(false);
+
+      const { data: sub } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
+        if (!mounted) return;
+        if (newSession?.user) {
+          setStoredServerToken(null);
+          setSession(newSession);
+          setUser(newSession.user);
+          await loadUserDetails(newSession.user.id);
+        } else {
+          setSession(null);
+          const hasServerToken =
+            typeof window !== 'undefined' &&
+            (Boolean(getStoredServerToken()) || Boolean(getStoredAdminToken()));
+          if (!hasServerToken) {
+            setUser(null);
+            setProfile(null);
+            setRole(null);
+          }
+        }
+        setLoading(false);
+      });
+      authSubscription = sub.subscription;
     };
 
-    void initAuth();
-
-    const { data: sub } = supabase.auth.onAuthStateChange(async (_event, newSession) => {
-      if (!mounted) return;
-      if (newSession?.user) {
-        setStoredServerToken(null);
-        setSession(newSession);
-        setUser(newSession.user);
-        await loadUserDetails(newSession.user.id);
-      } else {
-        setSession(null);
-        const hasServerToken =
-          typeof window !== 'undefined' &&
-          (Boolean(getStoredServerToken()) || Boolean(getStoredAdminToken()));
-        if (!hasServerToken) {
-          setUser(null);
-          setProfile(null);
-          setRole(null);
-        }
-      }
-      setLoading(false);
-    });
+    void bootstrapAuth();
 
     return () => {
       mounted = false;
-      sub.subscription.unsubscribe();
+      authSubscription?.unsubscribe();
     };
   }, [loadUserDetails, applyServerAuthSession]);
 
@@ -694,7 +713,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         role,
         isAdmin,
         loading,
-        isPreviewMode: !isSupabaseConfigured,
+        isPreviewMode: !supabaseReady && !isSupabaseConfigured,
         justLoggedIn,
         clearJustLoggedIn,
         triggerPostLoginWelcome,
