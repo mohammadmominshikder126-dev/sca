@@ -791,7 +791,48 @@ export default {
     }
 
     if (!pathname.startsWith('/api/')) {
-      return env.ASSETS.fetch(request);
+      let assetRes = await env.ASSETS.fetch(request);
+      if (assetRes.status === 404 && !/\.[a-z0-9]{1,8}$/i.test(pathname)) {
+        assetRes = await env.ASSETS.fetch(new Request(`${url.origin}/index.html`, { method: 'GET' }));
+      }
+      const contentType = assetRes.headers.get('content-type') || '';
+      if (contentType.includes('text/html')) {
+        const html = await assetRes.text();
+        const pageUrl = `${url.origin}${url.pathname}${url.search}`;
+        const escapedPageUrl = pageUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+        const imageUrl = `${url.origin}/assets/aistudio/Scania-Pick-up-2025-04-01-at-2.14.20_PM_d711a23d.jpg`;
+        const rewritten = html
+          .replace(/<title>[\s\S]*?<\/title>/i, () => '<title>Scania Investment Platform</title>')
+          .replace(
+            /<meta name="description" content="[^"]*"\s*\/?>/i,
+            () => '<meta name="description" content="Scania Investment Platform - Official Website." />'
+          )
+          .replace(/<link rel="canonical" href="[^"]*"\s*\/?>/i, () => `<link rel="canonical" href="${escapedPageUrl}" />`)
+          .replace(/<meta property="og:site_name" content="[^"]*"\s*\/?>/i, () => '<meta property="og:site_name" content="Scania Investment Platform" />')
+          .replace(/<meta property="og:url" content="[^"]*"\s*\/?>/i, () => `<meta property="og:url" content="${escapedPageUrl}" />`)
+          .replace(/<meta property="og:title" content="[^"]*"\s*\/?>/i, () => '<meta property="og:title" content="Scania Investment Platform" />')
+          .replace(
+            /<meta property="og:description" content="[^"]*"\s*\/?>/i,
+            () => '<meta property="og:description" content="Scania Investment Platform - Official Website." />'
+          )
+          .replace(/<meta property="og:image" content="[^"]*"\s*\/?>/i, () => `<meta property="og:image" content="${imageUrl}" />`)
+          .replace(/<meta property="og:image:secure_url" content="[^"]*"\s*\/?>/i, () => `<meta property="og:image:secure_url" content="${imageUrl}" />`)
+          .replace(/<meta name="twitter:title" content="[^"]*"\s*\/?>/i, () => '<meta name="twitter:title" content="Scania Investment Platform" />')
+          .replace(
+            /<meta name="twitter:description" content="[^"]*"\s*\/?>/i,
+            () => '<meta name="twitter:description" content="Scania Investment Platform - Official Website." />'
+          )
+          .replace(/<meta name="twitter:image" content="[^"]*"\s*\/?>/i, () => `<meta name="twitter:image" content="${imageUrl}" />`);
+
+        const headers = new Headers(assetRes.headers);
+        headers.set('Content-Type', 'text/html; charset=utf-8');
+        headers.set('Cache-Control', 'public, max-age=0, must-revalidate');
+        return new Response(method === 'HEAD' ? null : rewritten, {
+          status: assetRes.status,
+          headers,
+        });
+      }
+      return assetRes;
     }
 
     const state = await loadState();
