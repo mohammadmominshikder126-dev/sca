@@ -1,6 +1,6 @@
 {
   "name": "Scania Investment Platform",
-  "description": "Explore Scania fleet investment plans, track daily returns, manage your wallet, and grow your referral network with Scania Investment Platform.",
+  "description": "SCANIA একটি বিশ্বস্ত ইনভেস্টমেন্ট প্ল্যাটফর্ম — খুব দ্রুত পেমেন্ট, নিরাপদ ডিপোজিট ও উত্তোলন এবং নিয়মিত দৈনিক আয়ের বিশ্বস্ত মাধ্যম।",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
