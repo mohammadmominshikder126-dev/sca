@@ -1,6 +1,6 @@
 {
   "name": "Scania Investment Platform",
-  "description": "Simulated Scania fleet investment demo platform with mobile-first user portal and full-featured admin dashboard powered by Supabase.",
+  "description": "Explore Scania fleet investment plans, track daily returns, manage your wallet, and grow your referral network with Scania Investment Platform.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
