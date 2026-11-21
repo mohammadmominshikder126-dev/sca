@@ -81,7 +81,7 @@ export const UsersView: React.FC = () => {
         async () => {
           const { error } = await supabase!
             .from('profiles')
-            .update({ is_active: !target.is_active, updated_at: new Date().toISOString() })
+            .update({ is_active: !target.is_active })
             .eq('id', target.id);
           if (error) throw new Error(error.message);
           return { ok: true };
@@ -111,7 +111,7 @@ export const UsersView: React.FC = () => {
         async () => {
           const { error } = await supabase!
             .from('profiles')
-            .update({ ...payload, updated_at: new Date().toISOString() })
+            .update(payload)
             .eq('id', editingUser.id);
           if (error) throw new Error(error.message);
           return { ok: true };
@@ -157,7 +157,7 @@ export const UsersView: React.FC = () => {
           }
           const { error: profErr } = await supabase!
             .from('profiles')
-            .update({ demo_balance: nextBal, updated_at: new Date().toISOString() })
+            .update({ demo_balance: nextBal })
             .eq('id', balanceTarget.id);
           if (profErr) throw new Error(profErr.message);
 
@@ -269,7 +269,7 @@ export const UsersView: React.FC = () => {
           if (selectedTier.trim()) {
             await supabase!
               .from('profiles')
-              .update({ tier: selectedTier.trim(), updated_at: new Date().toISOString() })
+              .update({ tier: selectedTier.trim() })
               .eq('id', vipTarget.id);
           }
 

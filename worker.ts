@@ -703,6 +703,41 @@ async function sbRest<T = unknown>(
   }
 }
 
+async function sbPatchSafe<T = unknown>(
+  cfg: WorkerSupabaseConfig,
+  path: string,
+  body: Record<string, unknown>,
+  options: { useService?: boolean; prefer?: string } = {}
+): Promise<{ data: T | null; error: string | null; status: number }> {
+  const payload = { ...body };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (Object.keys(payload).length === 0) {
+      return { data: null, error: null, status: 200 };
+    }
+    const res = await sbRest<T>(cfg, path, {
+      method: 'PATCH',
+      body: payload,
+      useService: options.useService ?? true,
+      prefer: options.prefer,
+    });
+    if (!res.error) return res;
+    const match =
+      res.error.match(/Could not find the '([^']+)' column/i) ||
+      res.error.match(/column\s+(?:[a-z0-9_]+\.)?([a-z0-9_]+)\s+does not exist/i);
+    if (match && match[1] && match[1] in payload) {
+      delete payload[match[1]];
+      continue;
+    }
+    return res;
+  }
+  return sbRest<T>(cfg, path, {
+    method: 'PATCH',
+    body: payload,
+    useService: options.useService ?? true,
+    prefer: options.prefer,
+  });
+}
+
 async function sbGetAuthUser(cfg: WorkerSupabaseConfig, jwt: string): Promise<{ id: string; email?: string } | null> {
   const key = cfg.serviceKey || cfg.anonKey;
   if (!cfg.url || !key || !jwt) return null;
@@ -1919,15 +1954,11 @@ export default {
           useService: true,
           body: { used_count: bonus.used_count + 1 },
         });
-        await sbRest(sb, `profiles?id=eq.${encodeURIComponent(claims.uid)}`, {
-          method: 'PATCH',
-          useService: true,
-          body: {
-            demo_balance: Number(prof.demo_balance) + amount,
-            demo_bonus: Number(prof.demo_bonus) + amount,
-            updated_at: new Date().toISOString(),
-          },
+        const balRes = await sbPatchSafe(sb, `profiles?id=eq.${encodeURIComponent(claims.uid)}`, {
+          demo_balance: Number((Number(prof.demo_balance) + amount).toFixed(2)),
+          demo_bonus: Number((Number(prof.demo_bonus) + amount).toFixed(2)),
         });
+        if (balRes.error) return jsonResponse({ error: balRes.error }, 400);
         await sbRest(sb, 'demo_transactions', {
           method: 'POST',
           useService: true,
@@ -2003,13 +2034,11 @@ export default {
         if (Number(prof.demo_balance) < price) {
           return jsonResponse({ error: 'পর্যাপ্ত ব্যালেন্স নেই। অনুগ্রহ করে রিচার্জ করুন।' }, 400);
         }
-        const nowIso = new Date().toISOString();
         const expiresAt = new Date(Date.now() + Number(plan.validity_days) * 86400000).toISOString();
-        await sbRest(sb, `profiles?id=eq.${encodeURIComponent(claims.uid)}`, {
-          method: 'PATCH',
-          useService: true,
-          body: { demo_balance: Number(prof.demo_balance) - price, updated_at: nowIso },
+        const balRes = await sbPatchSafe(sb, `profiles?id=eq.${encodeURIComponent(claims.uid)}`, {
+          demo_balance: Number((Number(prof.demo_balance) - price).toFixed(2)),
         });
+        if (balRes.error) return jsonResponse({ error: balRes.error }, 400);
         const prodRes = await sbRest<WorkerUserProduct[]>(sb, 'demo_user_products', {
           method: 'POST',
           useService: true,
@@ -2842,10 +2871,8 @@ export default {
         const currentBal = Number(prof.demo_balance || 0);
 
         if (decision === 'approved' && sbTx.type === 'deposit_demo') {
-          const balUpd = await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
-            method: 'PATCH',
-            useService: true,
-            body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
+          const balUpd = await sbPatchSafe(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
+            demo_balance: Number((currentBal + txAmount).toFixed(2)),
           });
           if (balUpd.error) {
             return jsonResponse({ error: balUpd.error }, 400);
@@ -2859,14 +2886,12 @@ export default {
             );
             const refProf = refProfRes.data?.[0];
             if (refProf && comm > 0) {
-              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(refProf.id)}`, {
-                method: 'PATCH',
-                useService: true,
-                body: { demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)), updated_at: nowIso },
+              await sbPatchSafe(sb, `profiles?id=eq.${encodeURIComponent(refProf.id)}`, {
+                demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)),
               });
               const refRecRes = await sbRest<{ id: string; simulated_commission: number }[]>(
                 sb,
-                `referral_records?select=id,simulated_commission&referrer_id=eq.${encodeURIComponent(refProf.id)}&referred_user_id=eq.${encodeURIComponent(sbTx.user_id)}&level=eq.1&limit=1`,
+                `referral_records?select=id,simulated_commission&referrer_id=eq.${encodeURIComponent(refProf.id)}&referred_user_id=eq.${encodeURIComponent(sbTx.user_id)}&limit=1`,
                 { useService: true }
               );
               const refRec = refRecRes.data?.[0];
@@ -2915,30 +2940,24 @@ export default {
             }
           }
         } else if (decision === 'rejected' && sbTx.type === 'withdraw_demo') {
-          const refundUpd = await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
-            method: 'PATCH',
-            useService: true,
-            body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
+          const refundUpd = await sbPatchSafe(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
+            demo_balance: Number((currentBal + txAmount).toFixed(2)),
           });
           if (refundUpd.error) {
             return jsonResponse({ error: refundUpd.error }, 400);
           }
         }
 
-        const updRes = await sbRest<WorkerTransaction[]>(
+        const updRes = await sbPatchSafe<WorkerTransaction[]>(
           sb,
           `demo_transactions?id=eq.${encodeURIComponent(transactionId)}`,
           {
-            method: 'PATCH',
-            useService: true,
-            prefer: 'return=representation',
-            body: {
-              status: decision,
-              admin_note: adminNote ? adminNote.slice(0, 300) : decision === 'approved' ? 'কনফার্ম করা হয়েছে' : 'ব্যর্থ হয়েছে',
-              processed_by: isUuid(admin.uid) ? admin.uid : null,
-              updated_at: nowIso,
-            },
-          }
+            status: decision,
+            admin_note: adminNote ? adminNote.slice(0, 300) : decision === 'approved' ? 'কনফার্ম করা হয়েছে' : 'ব্যর্থ হয়েছে',
+            processed_by: isUuid(admin.uid) ? admin.uid : null,
+            updated_at: nowIso,
+          },
+          { prefer: 'return=representation' }
         );
         if (updRes.error) {
           return jsonResponse({ error: updRes.error }, 400);
@@ -3092,16 +3111,23 @@ export default {
           return jsonResponse({ error: 'User not found.' }, 404);
         }
         if (!action && method === 'PUT') {
-          const patch: Record<string, unknown> = { updated_at: nowIso };
+          const patch: Record<string, unknown> = {};
           if (typeof body.full_name === 'string' && body.full_name.trim()) patch.full_name = body.full_name.trim().slice(0, 80);
           if (typeof body.phone === 'string') patch.phone = body.phone.trim().slice(0, 30);
           if (typeof body.tier === 'string' && body.tier.trim()) patch.tier = body.tier.trim().slice(0, 40);
           if (typeof body.is_active === 'boolean') patch.is_active = body.is_active;
-          const updRes = await sbRest<Record<string, unknown>[]>(
-            sb,
-            `profiles?id=eq.${encodeURIComponent(targetId)}`,
-            { method: 'PATCH', useService: true, prefer: 'return=representation', body: patch }
-          );
+          const updRes = Object.keys(patch).length > 0
+            ? await sbPatchSafe<Record<string, unknown>[]>(
+                sb,
+                `profiles?id=eq.${encodeURIComponent(targetId)}`,
+                patch,
+                { prefer: 'return=representation' }
+              )
+            : await sbRest<Record<string, unknown>[]>(
+                sb,
+                `profiles?select=*&id=eq.${encodeURIComponent(targetId)}&limit=1`,
+                { useService: true }
+              );
           if (updRes.error) {
             return jsonResponse({ error: updRes.error }, 400);
           }
@@ -3142,10 +3168,11 @@ export default {
             return jsonResponse({ error: 'ব্যবহারকারীর ব্যালেন্সের চেয়ে বেশি টাকা কাটা যাবে না।' }, 400);
           }
           const nextBal = mode === 'add' ? Number((cur + amount).toFixed(2)) : Number((cur - amount).toFixed(2));
-          const updRes = await sbRest<Record<string, unknown>[]>(
+          const updRes = await sbPatchSafe<Record<string, unknown>[]>(
             sb,
             `profiles?id=eq.${encodeURIComponent(targetId)}`,
-            { method: 'PATCH', useService: true, prefer: 'return=representation', body: { demo_balance: nextBal, updated_at: nowIso } }
+            { demo_balance: nextBal },
+            { prefer: 'return=representation' }
           );
           if (updRes.error) {
             return jsonResponse({ error: updRes.error }, 400);
@@ -3245,11 +3272,7 @@ export default {
             return jsonResponse({ error: 'নির্বাচিত প্ল্যানটি পাওয়া যায়নি।' }, 404);
           }
           if (tier) {
-            const tierRes = await sbRest(sb, `profiles?id=eq.${encodeURIComponent(targetId)}`, {
-              method: 'PATCH',
-              useService: true,
-              body: { tier, updated_at: nowIso },
-            });
+            const tierRes = await sbPatchSafe(sb, `profiles?id=eq.${encodeURIComponent(targetId)}`, { tier });
             if (tierRes.error) {
               return jsonResponse({ error: tierRes.error }, 400);
             }

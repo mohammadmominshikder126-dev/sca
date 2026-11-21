@@ -1775,7 +1775,7 @@ async function startServer() {
       const nextBal = Number((currentBal - parsedAmount).toFixed(2));
       const { error: deductErr } = await supabaseAdmin
         .from('profiles')
-        .update({ demo_balance: nextBal, updated_at: nowIso })
+        .update({ demo_balance: nextBal })
         .eq('id', uid);
       if (deductErr) {
         res.status(400).json({ error: deductErr.message });
@@ -1813,7 +1813,7 @@ async function startServer() {
       if (type === 'withdraw_demo') {
         await supabaseAdmin
           .from('profiles')
-          .update({ demo_balance: currentBal, updated_at: new Date().toISOString() })
+          .update({ demo_balance: currentBal })
           .eq('id', uid);
       }
       res.status(400).json({ error: error.message });
@@ -1957,14 +1957,17 @@ async function startServer() {
       .update({ used_count: bonus.used_count + 1 })
       .eq('id', bonus.id);
 
-    await supabaseAdmin
+    const { error: balErr } = await supabaseAdmin
       .from('profiles')
       .update({
-        demo_balance: Number(profile.demo_balance) + amount,
-        demo_bonus: Number(profile.demo_bonus) + amount,
-        updated_at: new Date().toISOString(),
+        demo_balance: Number((Number(profile.demo_balance) + amount).toFixed(2)),
+        demo_bonus: Number((Number(profile.demo_bonus) + amount).toFixed(2)),
       })
       .eq('id', uid);
+    if (balErr) {
+      res.status(400).json({ error: balErr.message });
+      return;
+    }
 
     await supabaseAdmin.from('demo_transactions').insert({
       user_id: uid,
@@ -2087,13 +2090,16 @@ async function startServer() {
       return;
     }
 
-    await supabaseAdmin
+    const { error: planBalErr } = await supabaseAdmin
       .from('profiles')
       .update({
-        demo_balance: Number(profile.demo_balance) - price,
-        updated_at: new Date().toISOString(),
+        demo_balance: Number((Number(profile.demo_balance) - price).toFixed(2)),
       })
       .eq('id', uid);
+    if (planBalErr) {
+      res.status(400).json({ error: planBalErr.message });
+      return;
+    }
 
     const expiresAt = new Date(Date.now() + Number(plan.validity_days) * 86400000).toISOString();
     const { data: product, error: prodErr } = await supabaseAdmin
@@ -3096,10 +3102,14 @@ async function startServer() {
     const currentBal = Number(profile.demo_balance || 0);
 
     if (decision === 'approved' && tx.type === 'deposit_demo') {
-      await supabaseAdmin
+      const { error: balUpdErr } = await supabaseAdmin
         .from('profiles')
-        .update({ demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: new Date().toISOString() })
+        .update({ demo_balance: Number((currentBal + txAmount).toFixed(2)) })
         .eq('id', tx.user_id);
+      if (balUpdErr) {
+        res.status(400).json({ error: balUpdErr.message });
+        return;
+      }
 
       if (profile.referred_by) {
         const comm = Number((txAmount * 0.25).toFixed(2));
@@ -3111,14 +3121,13 @@ async function startServer() {
         if (refProf && comm > 0) {
           await supabaseAdmin
             .from('profiles')
-            .update({ demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)), updated_at: new Date().toISOString() })
+            .update({ demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)) })
             .eq('id', refProf.id);
           const { data: refRec } = await supabaseAdmin
             .from('referral_records')
             .select('id, simulated_commission')
             .eq('referrer_id', refProf.id)
             .eq('referred_user_id', tx.user_id)
-            .eq('level', 1)
             .maybeSingle();
           if (refRec) {
             await supabaseAdmin
@@ -3153,10 +3162,14 @@ async function startServer() {
       }
     } else if (decision === 'rejected' && tx.type === 'withdraw_demo') {
       // Refund deducted withdrawal balance back to user
-      await supabaseAdmin
+      const { error: refundErr } = await supabaseAdmin
         .from('profiles')
-        .update({ demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: new Date().toISOString() })
+        .update({ demo_balance: Number((currentBal + txAmount).toFixed(2)) })
         .eq('id', tx.user_id);
+      if (refundErr) {
+        res.status(400).json({ error: refundErr.message });
+        return;
+      }
     }
 
     const { data: updated, error: updErr } = await supabaseAdmin
@@ -3225,18 +3238,24 @@ async function startServer() {
       return;
     }
 
-    const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    const patch: Record<string, unknown> = {};
     if (typeof full_name === 'string' && full_name.trim()) patch.full_name = full_name.trim().slice(0, 80);
     if (typeof phone === 'string') patch.phone = phone.trim().slice(0, 30);
     if (typeof tier === 'string' && tier.trim()) patch.tier = tier.trim().slice(0, 40);
     if (typeof is_active === 'boolean') patch.is_active = is_active;
 
-    const { data, error } = await supabaseAdmin
-      .from('profiles')
-      .update(patch)
-      .eq('id', targetId)
-      .select()
-      .single();
+    const { data, error } = Object.keys(patch).length > 0
+      ? await supabaseAdmin
+          .from('profiles')
+          .update(patch)
+          .eq('id', targetId)
+          .select()
+          .single()
+      : await supabaseAdmin
+          .from('profiles')
+          .select('*')
+          .eq('id', targetId)
+          .single();
 
     if (error) {
       res.status(400).json({ error: error.message });
@@ -3344,7 +3363,7 @@ async function startServer() {
 
     const { data: updatedProf, error: updErr } = await supabaseAdmin
       .from('profiles')
-      .update({ demo_balance: nextBal, updated_at: nowIso })
+      .update({ demo_balance: nextBal })
       .eq('id', targetId)
       .select()
       .single();
@@ -3512,7 +3531,7 @@ async function startServer() {
     if (tier) {
       await supabaseAdmin
         .from('profiles')
-        .update({ tier, updated_at: nowIso })
+        .update({ tier })
         .eq('id', targetId);
     }
 

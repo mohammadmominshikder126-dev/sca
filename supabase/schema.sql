@@ -38,6 +38,7 @@ alter table public.profiles add column if not exists demo_bonus numeric(14, 2) n
 alter table public.profiles add column if not exists referral_code text;
 alter table public.profiles add column if not exists referred_by uuid references public.profiles(id) on delete set null;
 alter table public.profiles add column if not exists is_active boolean not null default true;
+alter table public.profiles add column if not exists updated_at timestamptz not null default now();
 
 -- 2.2 User Roles (Server-checked RBAC; never editable by normal users)
 create table if not exists public.user_roles (
