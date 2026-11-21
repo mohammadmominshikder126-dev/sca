@@ -33,6 +33,7 @@ export const DashboardView: React.FC = () => {
     allReferrals,
     auditLogs,
     realtimeStatus,
+    adminDbMode,
     refreshAll,
   } = usePlatformData();
   const { showToast } = useToast();
@@ -344,17 +345,21 @@ export const DashboardView: React.FC = () => {
 
           <div className="rounded-2xl p-4 bg-[#061844] text-white shadow-sm space-y-2.5 text-xs">
             <div className="flex items-center justify-between">
-              <span className="font-display font-bold text-sm">Demo Database Status</span>
+              <span className="font-display font-bold text-sm">Single Database Status</span>
               <span
                 className={
-                  realtimeStatus === 'connected'
+                  adminDbMode === 'supabase' && realtimeStatus === 'connected'
                     ? 'text-emerald-400 font-semibold'
-                    : realtimeStatus === 'connecting'
+                    : adminDbMode === 'connecting'
                     ? 'text-sky-300 font-semibold'
                     : 'text-amber-300 font-semibold'
                 }
               >
-                {realtimeStatus === 'connected' ? 'Connected' : realtimeStatus === 'connecting' ? 'Connecting...' : 'Preview'}
+                {adminDbMode === 'supabase' && realtimeStatus === 'connected'
+                  ? 'Connected'
+                  : adminDbMode === 'connecting'
+                  ? 'Connecting...'
+                  : 'Not Synced'}
               </span>
             </div>
             <div className="flex items-center justify-between text-blue-100">
@@ -363,21 +368,27 @@ export const DashboardView: React.FC = () => {
               </span>
               <span
                 className={
-                  realtimeStatus === 'connected'
+                  adminDbMode === 'supabase' && realtimeStatus === 'connected'
                     ? 'font-semibold text-emerald-300'
-                    : realtimeStatus === 'connecting'
+                    : adminDbMode === 'connecting'
                     ? 'font-semibold text-sky-300'
                     : 'font-semibold text-amber-300'
                 }
               >
-                {realtimeStatus === 'connected' ? 'Active' : realtimeStatus === 'connecting' ? 'Syncing...' : 'Setup Needed'}
+                {adminDbMode === 'supabase' && realtimeStatus === 'connected'
+                  ? 'Single DB Active'
+                  : adminDbMode === 'connecting'
+                  ? 'Syncing...'
+                  : 'Setup Needed'}
               </span>
             </div>
             <div className="flex items-center justify-between text-blue-100">
               <span className="inline-flex items-center gap-1.5">
                 <Server className="w-3.5 h-3.5 text-blue-300" /> Mode
               </span>
-              <span className="font-semibold text-amber-300">Demo Simulation Only</span>
+              <span className="font-semibold text-amber-300">
+                {adminDbMode === 'supabase' ? 'Unified Supabase' : 'Isolated Fallback'}
+              </span>
             </div>
           </div>
         </div>

@@ -28,7 +28,7 @@ import { ConfirmModal } from '../../components/ui/Feedback';
 
 export const AdminLayout: React.FC = () => {
   const { user, profile, isAdmin, loading, isPreviewMode, signOut } = useAuth();
-  const { siteSettings, allTransactions, allTickets, realtimeStatus } = usePlatformData();
+  const { siteSettings, allTransactions, allTickets, realtimeStatus, adminDbMode, adminDbWarning } = usePlatformData();
   const navigate = useNavigate();
 
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -224,18 +224,18 @@ export const AdminLayout: React.FC = () => {
             <span className="hidden sm:inline-flex items-center gap-1.5 text-xs font-medium text-blue-100">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  realtimeStatus === 'connected'
+                  adminDbMode === 'supabase' && realtimeStatus === 'connected'
                     ? 'bg-emerald-400'
-                    : realtimeStatus === 'preview'
+                    : adminDbMode === 'isolated' || realtimeStatus === 'preview'
                     ? 'bg-amber-400'
                     : 'bg-sky-300'
                 }`}
               />
               <span>
-                {realtimeStatus === 'connected'
-                  ? 'Supabase Realtime Live'
-                  : realtimeStatus === 'preview'
-                  ? 'Preview Mode'
+                {adminDbMode === 'supabase' && realtimeStatus === 'connected'
+                  ? 'Supabase Single DB Live'
+                  : adminDbMode === 'isolated' || realtimeStatus === 'preview'
+                  ? 'Isolated Memory (Setup Needed)'
                   : 'Connecting...'}
               </span>
             </span>
@@ -269,12 +269,14 @@ export const AdminLayout: React.FC = () => {
           </div>
         </header>
 
-        {isPreviewMode && (
-          <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 text-xs text-amber-900 flex flex-wrap items-center justify-between gap-2">
+        {(isPreviewMode || adminDbMode === 'isolated') && (
+          <div className="bg-amber-50 border-b border-amber-200 px-4 py-2.5 text-xs text-amber-950 flex flex-wrap items-center justify-between gap-2">
             <span>
-              <strong>Preview Mode:</strong> Supabase is not configured yet. Connect your Supabase URL & keys to save changes and test live Realtime sync.
+              <strong>সতর্কতা (একটি ডাটাবেস সংযুক্ত নয়):</strong>{' '}
+              {adminDbWarning ||
+                'Supabase URL ও Keys এখনো Cloudflare Worker-এ সেট করা নেই। সব ব্রাউজার ও ডিভাইসে একই ডাটা দেখতে VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY এবং SUPABASE_SERVICE_ROLE_KEY যুক্ত করুন।'}
             </span>
-            <Link to="/setup" className="font-bold underline">
+            <Link to="/setup" className="font-bold underline shrink-0">
               Open Setup Guide →
             </Link>
           </div>

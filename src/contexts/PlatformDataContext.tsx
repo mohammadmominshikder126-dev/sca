@@ -53,6 +53,8 @@ interface PlatformDataContextValue {
   auditLogs: AdminAuditLog[];
   ticketMessages: Record<string, SupportMessage[]>;
   realtimeStatus: 'connected' | 'connecting' | 'preview';
+  adminDbMode: 'supabase' | 'isolated' | 'connecting';
+  adminDbWarning: string | null;
   loadingData: boolean;
   refreshAll: () => Promise<void>;
   loadTicketMessages: (ticketId: string) => Promise<void>;
@@ -81,6 +83,8 @@ const PlatformDataContext = createContext<PlatformDataContextValue>({
   auditLogs: [],
   ticketMessages: {},
   realtimeStatus: 'preview',
+  adminDbMode: 'connecting',
+  adminDbWarning: null,
   loadingData: false,
   refreshAll: async () => {},
   loadTicketMessages: async () => {},
@@ -118,6 +122,8 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
   const [realtimeStatus, setRealtimeStatus] = useState<'connected' | 'connecting' | 'preview'>(
     isSupabaseConfigured ? 'connecting' : 'preview'
   );
+  const [adminDbMode, setAdminDbMode] = useState<'supabase' | 'isolated' | 'connecting'>('connecting');
+  const [adminDbWarning, setAdminDbWarning] = useState<string | null>(null);
   const [loadingData, setLoadingData] = useState<boolean>(isSupabaseConfigured);
 
   const fetchServerUserState = useCallback(async (token: string) => {
@@ -142,6 +148,9 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
   const fetchAdminDirectlyFromSupabase = useCallback(async () => {
     if (!supabase) return false;
     try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData.session?.user) return false;
+
       const [profRes, allTxRes, allProdRes, bonusRes, allRefRes, allTicketsRes, logsRes] = await Promise.all([
         supabase.from('profiles').select('*').order('created_at', { ascending: false }),
         supabase.from('demo_transactions').select('*').order('created_at', { ascending: false }),
@@ -152,12 +161,12 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         supabase.from('admin_audit_logs').select('*').order('created_at', { ascending: false }).limit(50),
       ]);
 
-      const profList = (!profRes.error && profRes.data ? (profRes.data as Profile[]) : []) || [];
+      if (profRes.error) return false;
+
+      const profList = (profRes.data as Profile[]) || [];
       const profMap = new Map(profList.map((p) => [p.id, p]));
 
-      if (!profRes.error && profRes.data) {
-        setAllProfiles(profList);
-      }
+      setAllProfiles(profList);
 
       if (!allTxRes.error && allTxRes.data) {
         const joinedTx = (allTxRes.data as DemoTransaction[]).map((tx) => {
@@ -295,6 +304,8 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
           });
           if (adminRes.ok) {
             const adminData = (await adminRes.json()) as {
+              mode?: string;
+              warning?: string;
               profiles?: Profile[];
               transactions?: DemoTransaction[];
               referrals?: ReferralRecord[];
@@ -320,14 +331,26 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
             if (adminData.siteSettings) setSiteSettings(adminData.siteSettings);
             if (Array.isArray(adminData.supportTickets)) setAllTickets(adminData.supportTickets);
             if (Array.isArray(adminData.auditLogs)) setAuditLogs(adminData.auditLogs);
-            setRealtimeStatus('connected');
+
+            if (adminData.mode === 'supabase') {
+              setAdminDbMode('supabase');
+              setAdminDbWarning(null);
+              setRealtimeStatus('connected');
+            } else {
+              setAdminDbMode('isolated');
+              setAdminDbWarning(
+                adminData.warning ||
+                  'সার্ভার/Cloudflare Worker-এ Supabase URL এবং Service Key যুক্ত না থাকায় বর্তমানে আলাদা অস্থায়ী মেমোরিতে চলছে।'
+              );
+              setRealtimeStatus('preview');
+            }
           }
         } catch {
           // Preserve existing state on transient error
         }
       }
       setLoadingData(false);
-      if (backendOnline) setRealtimeStatus('connected');
+      if (backendOnline && !isAdmin) setRealtimeStatus('connected');
       return;
     }
 
@@ -460,14 +483,12 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
                 supportTickets?: SupportTicket[];
                 auditLogs?: AdminAuditLog[];
               };
-              const hasLivePayload =
-                Boolean(adminData.ok) ||
-                adminData.mode === 'supabase' ||
-                adminData.schemaReady === true ||
-                Array.isArray(adminData.profiles) ||
-                Array.isArray(adminData.transactions);
+              const hasSupabasePayload =
+                adminData.mode === 'supabase' &&
+                adminData.schemaReady !== false &&
+                Array.isArray(adminData.profiles);
 
-              if (hasLivePayload) {
+              if (hasSupabasePayload) {
                 if (Array.isArray(adminData.profiles)) setAllProfiles(adminData.profiles);
                 if (Array.isArray(adminData.transactions)) setAllTransactions(adminData.transactions);
                 if (Array.isArray(adminData.referrals)) setAllReferrals(adminData.referrals);
@@ -481,7 +502,14 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
                 if (Array.isArray(adminData.supportTickets)) setAllTickets(adminData.supportTickets);
                 if (Array.isArray(adminData.auditLogs)) setAuditLogs(adminData.auditLogs);
                 fetchedViaAdminApi = true;
+                setAdminDbMode('supabase');
+                setAdminDbWarning(null);
                 setRealtimeStatus('connected');
+              } else if (adminData.mode === 'server') {
+                setAdminDbMode('isolated');
+                setAdminDbWarning(
+                  'সার্ভার/Worker-এ Supabase Service Key বা URL মিসিং থাকায় /api/admin/state আইসোলেট মোডে রয়েছে।'
+                );
               }
             }
           } catch {
@@ -492,6 +520,8 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         if (!fetchedViaAdminApi) {
           const directOk = await fetchAdminDirectlyFromSupabase();
           if (directOk) {
+            setAdminDbMode('supabase');
+            setAdminDbWarning(null);
             setRealtimeStatus('connected');
           }
         }
@@ -668,6 +698,8 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         auditLogs,
         ticketMessages,
         realtimeStatus,
+        adminDbMode,
+        adminDbWarning,
         loadingData,
         refreshAll: () => fetchPublicAndUser(false),
         loadTicketMessages,

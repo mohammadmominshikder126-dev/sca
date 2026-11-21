@@ -2309,79 +2309,93 @@ async function startServer() {
           isMissingTableError(txRes.error) ||
           isMissingTableError(plansRes.error);
 
-        if (!missingSchema && !profRes.error) {
-          const sbProfiles = (profRes.data || []) as Record<string, unknown>[];
-          const profileMap = new Map(sbProfiles.map((p) => [String(p.id), p]));
-
-          const sbTransactions = (txRes.data || []).map((t: Record<string, unknown>) => {
-            const p = profileMap.get(String(t.user_id));
-            return {
-              ...t,
-              profiles: p
-                ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email }
-                : undefined,
-            };
-          });
-
-          const sbReferrals = (refRes.data || []).map((r: Record<string, unknown>) => {
-            const referred = profileMap.get(String(r.referred_user_id));
-            const referrer = profileMap.get(String(r.referrer_id));
-            return {
-              ...r,
-              referred: referred
-                ? {
-                    id: referred.id,
-                    full_name: referred.full_name,
-                    scania_id: referred.scania_id,
-                    email: referred.email,
-                    tier: referred.tier,
-                    created_at: referred.created_at,
-                  }
-                : undefined,
-              referrer: referrer
-                ? {
-                    id: referrer.id,
-                    full_name: referrer.full_name,
-                    scania_id: referrer.scania_id,
-                  }
-                : undefined,
-            };
-          });
-
-          const sbTickets = (ticketsRes.data || []).map((tk: Record<string, unknown>) => {
-            const p = profileMap.get(String(tk.user_id));
-            return {
-              ...tk,
-              profiles: p
-                ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email }
-                : undefined,
-            };
-          });
-
-          const sbBankCards = await getAllSupabaseBankCards();
-
-          res.json({
-            ok: true,
+        if (missingSchema || profRes.error) {
+          res.status(503).json({
+            ok: false,
             mode: 'supabase',
-            schemaReady: true,
-            profiles: sbProfiles,
-            transactions: sbTransactions,
-            referrals: sbReferrals,
-            userProducts: prodRes.data || [],
-            bankCards: { ...store.bankCards, ...sbBankCards },
-            bonusCodes: bonusRes.data || [],
-            announcements: annRes.data || store.announcements,
-            plans: plansRes.data && plansRes.data.length > 0 ? plansRes.data : store.plans || DEFAULT_SERVER_PLANS,
-            banners: bannersRes.data || store.banners,
-            siteSettings: settingsRes.data || store.siteSettings,
-            notifications: notifRes.data || [],
-            supportTickets: sbTickets,
-            auditLogs: logsRes.data || [],
+            schemaReady: false,
+            error: profRes.error?.message || txRes.error?.message || plansRes.error?.message || 'Supabase query failed.',
           });
           return;
         }
-      } catch {
-        // Fall through to local store fallback
+
+        const sbProfiles = (profRes.data || []) as Record<string, unknown>[];
+        const profileMap = new Map(sbProfiles.map((p) => [String(p.id), p]));
+
+        const sbTransactions = (txRes.data || []).map((t: Record<string, unknown>) => {
+          const p = profileMap.get(String(t.user_id));
+          return {
+            ...t,
+            profiles: p
+              ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email }
+              : undefined,
+          };
+        });
+
+        const sbReferrals = (refRes.data || []).map((r: Record<string, unknown>) => {
+          const referred = profileMap.get(String(r.referred_user_id));
+          const referrer = profileMap.get(String(r.referrer_id));
+          return {
+            ...r,
+            referred: referred
+              ? {
+                  id: referred.id,
+                  full_name: referred.full_name,
+                  scania_id: referred.scania_id,
+                  email: referred.email,
+                  tier: referred.tier,
+                  created_at: referred.created_at,
+                }
+              : undefined,
+            referrer: referrer
+              ? {
+                  id: referrer.id,
+                  full_name: referrer.full_name,
+                  scania_id: referrer.scania_id,
+                }
+              : undefined,
+          };
+        });
+
+        const sbTickets = (ticketsRes.data || []).map((tk: Record<string, unknown>) => {
+          const p = profileMap.get(String(tk.user_id));
+          return {
+            ...tk,
+            profiles: p
+              ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email }
+              : undefined,
+          };
+        });
+
+        const sbBankCards = await getAllSupabaseBankCards();
+
+        res.json({
+          ok: true,
+          mode: 'supabase',
+          schemaReady: true,
+          profiles: sbProfiles,
+          transactions: sbTransactions,
+          referrals: sbReferrals,
+          userProducts: prodRes.data || [],
+          bankCards: sbBankCards,
+          bonusCodes: bonusRes.data || [],
+          announcements: annRes.data || [],
+          plans: plansRes.data && plansRes.data.length > 0 ? plansRes.data : DEFAULT_SERVER_PLANS,
+          banners: bannersRes.data || [],
+          siteSettings: settingsRes.data || null,
+          notifications: notifRes.data || [],
+          supportTickets: sbTickets,
+          auditLogs: logsRes.data || [],
+        });
+        return;
+      } catch (err) {
+        res.status(503).json({
+          ok: false,
+          mode: 'supabase',
+          schemaReady: false,
+          error: (err as Error).message || 'Supabase unavailable.',
+        });
+        return;
       }
     }
 

@@ -9,9 +9,15 @@ interface Env {
   ADMIN_PASSWORD?: string;
   SUPABASE_URL?: string;
   VITE_SUPABASE_URL?: string;
+  PUBLIC_SUPABASE_URL?: string;
+  NEXT_PUBLIC_SUPABASE_URL?: string;
+  SUPABASE_PROJECT_URL?: string;
   SUPABASE_ANON_KEY?: string;
   VITE_SUPABASE_ANON_KEY?: string;
+  PUBLIC_SUPABASE_ANON_KEY?: string;
+  NEXT_PUBLIC_SUPABASE_ANON_KEY?: string;
   SUPABASE_SERVICE_ROLE_KEY?: string;
+  SUPABASE_SECRET_KEY?: string;
 }
 
 interface WorkerMemberRecord {
@@ -603,12 +609,25 @@ interface WorkerSupabaseConfig {
 }
 
 function getSupabaseConfig(env: Env): WorkerSupabaseConfig {
-  const url = cleanEnvSecret(env.VITE_SUPABASE_URL || env.SUPABASE_URL, ['VITE_SUPABASE_URL', 'SUPABASE_URL']).replace(/\/+$/, '');
-  const anonKey = cleanEnvSecret(env.VITE_SUPABASE_ANON_KEY || env.SUPABASE_ANON_KEY, [
-    'VITE_SUPABASE_ANON_KEY',
-    'SUPABASE_ANON_KEY',
-  ]);
-  const serviceKey = cleanEnvSecret(env.SUPABASE_SERVICE_ROLE_KEY, ['SUPABASE_SERVICE_ROLE_KEY']);
+  const url = cleanEnvSecret(
+    env.VITE_SUPABASE_URL ||
+      env.SUPABASE_URL ||
+      env.PUBLIC_SUPABASE_URL ||
+      env.NEXT_PUBLIC_SUPABASE_URL ||
+      env.SUPABASE_PROJECT_URL,
+    ['VITE_SUPABASE_URL', 'SUPABASE_URL', 'PUBLIC_SUPABASE_URL', 'NEXT_PUBLIC_SUPABASE_URL', 'SUPABASE_PROJECT_URL']
+  ).replace(/\/+$/, '');
+  const anonKey = cleanEnvSecret(
+    env.VITE_SUPABASE_ANON_KEY ||
+      env.SUPABASE_ANON_KEY ||
+      env.PUBLIC_SUPABASE_ANON_KEY ||
+      env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    ['VITE_SUPABASE_ANON_KEY', 'SUPABASE_ANON_KEY', 'PUBLIC_SUPABASE_ANON_KEY', 'NEXT_PUBLIC_SUPABASE_ANON_KEY']
+  );
+  const serviceKey = cleanEnvSecret(
+    env.SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_SECRET_KEY,
+    ['SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SECRET_KEY']
+  );
 
   let serviceKeyType = 'none';
   if (serviceKey) {
@@ -895,6 +914,8 @@ export default {
         runtime: 'cloudflare-worker',
         supabaseConfigured: sb.publicReady,
         adminApiReady: sb.adminReady,
+        hasUrl: Boolean(sb.url),
+        hasAnonKey: Boolean(sb.anonKey),
         schemaReady,
         missingTables,
         serviceKeyType: sb.serviceKeyType,
@@ -977,15 +998,15 @@ export default {
 
         const sbSettings = !settingsRes.error && settingsRes.data && settingsRes.data[0] ? settingsRes.data[0] : null;
         const sbPlans = !plansRes.error && plansRes.data && plansRes.data.length > 0 ? plansRes.data : null;
-        const sbAnn = !annRes.error && annRes.data && annRes.data.length > 0 ? annRes.data : null;
-        const sbBanners = !bannersRes.error && bannersRes.data && bannersRes.data.length > 0 ? bannersRes.data : null;
+        const sbAnn = !annRes.error && annRes.data ? annRes.data : null;
+        const sbBanners = !bannersRes.error && bannersRes.data ? bannersRes.data : null;
 
-        if (sbSettings || sbPlans || sbAnn || sbBanners) {
+        if (!settingsRes.error || !plansRes.error || !annRes.error || !bannersRes.error) {
           return jsonResponse({
-            siteSettings: sbSettings || state.siteSettings,
-            announcements: sbAnn || state.announcements,
-            plans: sbPlans || state.plans,
-            banners: sbBanners || state.banners,
+            siteSettings: sbSettings,
+            announcements: sbAnn || [],
+            plans: sbPlans || DEFAULT_PLANS,
+            banners: sbBanners || [],
             runtime: 'cloudflare-worker',
           });
         }
@@ -1437,17 +1458,21 @@ export default {
           `profiles?select=*&id=eq.${encodeURIComponent(claims.uid)}&limit=1`,
           { useService: true }
         );
-        const prof = profRes.data?.[0];
-        if (prof) {
-          if (prof.is_active === false) {
-            return jsonResponse({ error: 'অ্যাকাউন্টটি নিষ্ক্রিয় করা হয়েছে।' }, 403);
-          }
-          return jsonResponse({
-            ok: true,
-            runtime: 'cloudflare-worker',
-            profile: prof,
-          });
+        if (profRes.error) {
+          return jsonResponse({ error: profRes.error }, 503);
         }
+        const prof = profRes.data?.[0];
+        if (!prof) {
+          return jsonResponse({ error: 'Profile not found.' }, 401);
+        }
+        if (prof.is_active === false) {
+          return jsonResponse({ error: 'অ্যাকাউন্টটি নিষ্ক্রিয় করা হয়েছে।' }, 403);
+        }
+        return jsonResponse({
+          ok: true,
+          runtime: 'cloudflare-worker',
+          profile: prof,
+        });
       }
       const member = ensureMemberFromClaims(state, claims);
       return jsonResponse({
@@ -1519,7 +1544,7 @@ export default {
             }
           }
 
-          const bankCard = state.bankCards[uid] || (await sbGetUserBankCard(sb, uid));
+          const bankCard = await sbGetUserBankCard(sb, uid);
 
           return jsonResponse({
             ok: true,
@@ -1534,6 +1559,7 @@ export default {
             })),
           });
         }
+        return jsonResponse({ error: profRes.error || txRes.error || 'Supabase query failed' }, 503);
       }
 
       const member = ensureMemberFromClaims(state, claims);
@@ -1596,6 +1622,7 @@ export default {
         if (saveErr) {
           return jsonResponse({ error: `ব্যাংক কার্ড সংরক্ষণ করা যায়নি: ${saveErr}` }, 400);
         }
+        return jsonResponse({ ok: true, bankCard: card });
       }
       state.bankCards[claims.uid] = card;
       await saveState(state);
@@ -1689,7 +1716,7 @@ export default {
         if (!prof || !prof.is_active) {
           return jsonResponse({ error: 'অ্যাকাউন্ট সক্রিয় নয় বা পাওয়া যায়নি।' }, 403);
         }
-        const bankCard = state.bankCards[uid] || (await sbGetUserBankCard(sb, uid));
+        const bankCard = await sbGetUserBankCard(sb, uid);
         if (type === 'withdraw_demo') {
           if (parsedAmount < 150) return jsonResponse({ error: 'সর্বনিম্ন উত্তোলন 150 টাকা।' }, 400);
           if (!bankCard) {
@@ -2205,72 +2232,82 @@ export default {
           (txRes.error && isMissingTableMsg(txRes.error)) ||
           (plansRes.error && isMissingTableMsg(plansRes.error));
 
-        if (!missingSchema && !profRes.error) {
-          const sbProfiles = profRes.data || [];
-          const profileMap = new Map(sbProfiles.map((p) => [String(p.id), p]));
-
-          const sbTransactions = (txRes.data || []).map((t) => {
-            const p = profileMap.get(String(t.user_id));
-            return {
-              ...t,
-              profiles: p ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email } : undefined,
-            };
-          });
-
-          const sbReferrals = (refRes.data || []).map((r) => {
-            const referred = profileMap.get(String(r.referred_user_id));
-            const referrer = profileMap.get(String(r.referrer_id));
-            return {
-              ...r,
-              referred: referred
-                ? {
-                    id: referred.id,
-                    full_name: referred.full_name,
-                    scania_id: referred.scania_id,
-                    email: referred.email,
-                    tier: referred.tier,
-                    created_at: referred.created_at,
-                  }
-                : undefined,
-              referrer: referrer
-                ? {
-                    id: referrer.id,
-                    full_name: referrer.full_name,
-                    scania_id: referrer.scania_id,
-                  }
-                : undefined,
-            };
-          });
-
-          const sbTickets = (ticketsRes.data || []).map((tk) => {
-            const p = profileMap.get(String(tk.user_id));
-            return {
-              ...tk,
-              profiles: p ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email } : undefined,
-            };
-          });
-
-          const sbBankCards = await sbGetAllBankCards(sb);
-
-          return jsonResponse({
-            ok: true,
-            mode: 'supabase',
-            schemaReady: true,
-            profiles: sbProfiles,
-            transactions: sbTransactions,
-            referrals: sbReferrals,
-            userProducts: prodRes.data || [],
-            bankCards: { ...state.bankCards, ...sbBankCards },
-            bonusCodes: bonusRes.data || [],
-            announcements: annRes.data || state.announcements,
-            plans: plansRes.data && plansRes.data.length > 0 ? plansRes.data : state.plans || DEFAULT_PLANS,
-            banners: bannersRes.data || state.banners,
-            siteSettings: settingsRes.data?.[0] || state.siteSettings,
-            notifications: notifRes.data || [],
-            supportTickets: sbTickets,
-            auditLogs: logsRes.data || [],
-          });
+        if (missingSchema || profRes.error) {
+          return jsonResponse(
+            {
+              ok: false,
+              mode: 'supabase',
+              schemaReady: false,
+              error: profRes.error || txRes.error || plansRes.error || 'Supabase schema incomplete.',
+            },
+            503
+          );
         }
+
+        const sbProfiles = profRes.data || [];
+        const profileMap = new Map(sbProfiles.map((p) => [String(p.id), p]));
+
+        const sbTransactions = (txRes.data || []).map((t) => {
+          const p = profileMap.get(String(t.user_id));
+          return {
+            ...t,
+            profiles: p ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email } : undefined,
+          };
+        });
+
+        const sbReferrals = (refRes.data || []).map((r) => {
+          const referred = profileMap.get(String(r.referred_user_id));
+          const referrer = profileMap.get(String(r.referrer_id));
+          return {
+            ...r,
+            referred: referred
+              ? {
+                  id: referred.id,
+                  full_name: referred.full_name,
+                  scania_id: referred.scania_id,
+                  email: referred.email,
+                  tier: referred.tier,
+                  created_at: referred.created_at,
+                }
+              : undefined,
+            referrer: referrer
+              ? {
+                  id: referrer.id,
+                  full_name: referrer.full_name,
+                  scania_id: referrer.scania_id,
+                }
+              : undefined,
+          };
+        });
+
+        const sbTickets = (ticketsRes.data || []).map((tk) => {
+          const p = profileMap.get(String(tk.user_id));
+          return {
+            ...tk,
+            profiles: p ? { full_name: p.full_name, scania_id: p.scania_id, email: p.email } : undefined,
+          };
+        });
+
+        const sbBankCards = await sbGetAllBankCards(sb);
+
+        return jsonResponse({
+          ok: true,
+          mode: 'supabase',
+          schemaReady: true,
+          profiles: sbProfiles,
+          transactions: sbTransactions,
+          referrals: sbReferrals,
+          userProducts: prodRes.data || [],
+          bankCards: sbBankCards,
+          bonusCodes: bonusRes.data || [],
+          announcements: annRes.data || [],
+          plans: plansRes.data && plansRes.data.length > 0 ? plansRes.data : DEFAULT_PLANS,
+          banners: bannersRes.data || [],
+          siteSettings: settingsRes.data?.[0] || null,
+          notifications: notifRes.data || [],
+          supportTickets: sbTickets,
+          auditLogs: logsRes.data || [],
+        });
       }
 
       const memberMap = new Map(state.members.map((m) => [m.id, m]));
@@ -2278,6 +2315,7 @@ export default {
         ok: true,
         mode: 'server',
         schemaReady: false,
+        warning: 'Cloudflare Worker-এ Supabase URL/Key কনফিগার করা নেই; বর্তমানে আইসোলেট-ভিত্তিক মেমোরিতে চলছে।',
         profiles: state.members
           .map(sanitizeMemberProfile)
           .sort((a, b) => b.created_at.localeCompare(a.created_at)),
