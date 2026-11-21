@@ -1,6 +1,6 @@
 {
   "name": "Scania Investment Platform",
-  "description": "Scania Investment Platform - Official Website.",
+  "description": "Scania Trusted Platform - Fast Payment Gateway",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
