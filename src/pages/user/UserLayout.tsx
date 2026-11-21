@@ -52,6 +52,32 @@ export const UserLayout: React.FC = () => {
     return <Navigate to="/login" replace />;
   }
 
+  if (profile.is_active === false) {
+    return (
+      <div className="min-h-screen bg-[#E9F1FC] flex items-center justify-center p-4">
+        <div className="w-full max-w-sm bg-white rounded-3xl p-6 shadow-xl border border-rose-100 text-center space-y-4">
+          <ScaniaLogoEmblem className="w-12 h-12 mx-auto" />
+          <div className="space-y-1.5">
+            <h1 className="font-display text-lg font-bold text-rose-700">অ্যাকাউন্ট নিষ্ক্রিয় করা হয়েছে</h1>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              অ্যাডমিন আপনার অ্যাকাউন্টটি সাময়িকভাবে নিষ্ক্রিয় করেছেন। বিস্তারিত জানতে কাস্টমার সাপোর্টে যোগাযোগ করুন।
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={async () => {
+              await signOut();
+              navigate('/login');
+            }}
+            className="w-full py-3 rounded-2xl bg-[#061844] text-white text-xs font-bold hover:opacity-95"
+          >
+            লগইন পেজে ফিরে যান
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const navItems = [
     { to: '/user', label: 'হোম', icon: Home, end: true },
     ...(siteSettings.show_team_tab ? [{ to: '/user/team', label: 'টিম', icon: Users, end: false }] : []),

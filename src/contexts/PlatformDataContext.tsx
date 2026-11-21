@@ -1,5 +1,11 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { getStoredAdminToken, getStoredServerToken, isSupabaseConfigured, supabase } from '../lib/supabase';
+import {
+  getStoredAdminToken,
+  getStoredServerToken,
+  hydrateRuntimeSupabaseConfig,
+  isSupabaseConfigured,
+  supabase,
+} from '../lib/supabase';
 import {
   AdminAuditLog,
   Announcement,
@@ -220,6 +226,9 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
   }, []);
 
   const fetchPublicAndUser = useCallback(async (silent = false) => {
+    if (!isSupabaseConfigured || !supabase) {
+      await hydrateRuntimeSupabaseConfig();
+    }
     // 1. Always check backend-synced site settings / plans / announcements / banners
     let serverPublic: {
       siteSettings?: SiteSettings | null;
@@ -347,16 +356,16 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
         setPlans(plansRes.data as DemoPlan[]);
       } else if (serverPublic.plans && serverPublic.plans.length > 0) {
         setPlans(serverPublic.plans);
-      } else if (plans.length === 0) {
-        setPlans(PREVIEW_PLANS);
+      } else {
+        setPlans((prev) => (prev.length === 0 ? PREVIEW_PLANS : prev));
       }
 
       if (!annRes.error && annRes.data && annRes.data.length > 0) {
         setAnnouncements(annRes.data as Announcement[]);
       } else if (serverPublic.announcements && serverPublic.announcements.length > 0) {
         setAnnouncements(serverPublic.announcements);
-      } else if (announcements.length === 0) {
-        setAnnouncements(PREVIEW_ANNOUNCEMENTS);
+      } else {
+        setAnnouncements((prev) => (prev.length === 0 ? PREVIEW_ANNOUNCEMENTS : prev));
       }
 
       if (!bannersRes.error && bannersRes.data && bannersRes.data.length > 0) {
@@ -435,6 +444,7 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
             });
             if (adminRes.ok) {
               const adminData = (await adminRes.json()) as {
+                ok?: boolean;
                 mode?: string;
                 schemaReady?: boolean;
                 profiles?: Profile[];
@@ -451,10 +461,11 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
                 auditLogs?: AdminAuditLog[];
               };
               const hasLivePayload =
+                Boolean(adminData.ok) ||
                 adminData.mode === 'supabase' ||
                 adminData.schemaReady === true ||
-                (Array.isArray(adminData.profiles) && adminData.profiles.length > 0) ||
-                (Array.isArray(adminData.transactions) && adminData.transactions.length > 0);
+                Array.isArray(adminData.profiles) ||
+                Array.isArray(adminData.transactions);
 
               if (hasLivePayload) {
                 if (Array.isArray(adminData.profiles)) setAllProfiles(adminData.profiles);
@@ -491,12 +502,10 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
   }, [
     user?.id,
     isAdmin,
+    isPreviewMode,
     authLoading,
     fetchServerUserState,
     fetchAdminDirectlyFromSupabase,
-    plans.length,
-    announcements.length,
-    notifications.length,
   ]);
 
   useEffect(() => {
@@ -532,14 +541,16 @@ export const PlatformDataProvider: React.FC<{ children: React.ReactNode }> = ({ 
       }
     };
 
-    const interval = window.setInterval(syncNow, 4000);
+    const interval = window.setInterval(syncNow, 2500);
     window.addEventListener('focus', syncNow);
+    window.addEventListener('online', syncNow);
     document.addEventListener('visibilitychange', syncNow);
 
     return () => {
       es?.close();
       window.clearInterval(interval);
       window.removeEventListener('focus', syncNow);
+      window.removeEventListener('online', syncNow);
       document.removeEventListener('visibilitychange', syncNow);
     };
   }, [fetchPublicAndUser, refreshProfile]);

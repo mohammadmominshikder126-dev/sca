@@ -91,7 +91,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const triggerPostLoginWelcome = useCallback(() => setJustLoggedIn(true), []);
 
   const loadUserDetails = useCallback(async (uid: string) => {
-    if (!supabase) return;
+    if (!supabase) return null;
     const [{ data: prof }, { data: roleRow, error: roleErr }] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', uid).maybeSingle(),
       supabase.from('user_roles').select('role').eq('user_id', uid).maybeSingle(),
@@ -101,6 +101,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!roleErr) {
       setRole((roleRow?.role as AppRole) || 'user');
     }
+    return (prof as Profile | null) ?? null;
   }, []);
 
   const applyServerAuthSession = useCallback((srvProfile: Profile, token?: string, nextRole: AppRole = 'user') => {
@@ -160,10 +161,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         try {
           const res = await fetch('/api/auth/me', {
             headers: { Authorization: `Bearer ${token}` },
+            cache: 'no-store',
           });
           if (res.ok) {
             const data = (await res.json()) as { profile?: Profile };
             if (data.profile) applyServerAuthSession(data.profile);
+          } else if (res.status === 401 || res.status === 403) {
+            const body = (await res.json().catch(() => ({}))) as { error?: string };
+            setStoredServerToken(null);
+            if (body.error && res.status === 403) {
+              setProfile((prev) => (prev ? { ...prev, is_active: false } : prev));
+            }
           }
         } catch {
           // Ignore refresh network error
@@ -491,7 +499,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return { error: error.message };
     }
     if (data.user) {
-      await loadUserDetails(data.user.id);
+      const prof = await loadUserDetails(data.user.id);
+      if (prof && prof.is_active === false) {
+        await supabase.auth.signOut();
+        setSession(null);
+        setUser(null);
+        setProfile(null);
+        setRole(null);
+        return { error: 'অ্যাকাউন্টটি অ্যাডমিন কর্তৃক নিষ্ক্রিয় করা হয়েছে।' };
+      }
     }
     setJustLoggedIn(true);
     return {};

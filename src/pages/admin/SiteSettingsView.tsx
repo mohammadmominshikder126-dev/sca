@@ -55,7 +55,7 @@ export const SiteSettingsView: React.FC = () => {
         }
         const { data: sessionData } = await supabase.auth.getSession();
         const token = sessionData.session?.access_token;
-        await fetch('/api/admin/site-settings', {
+        const res = await fetch('/api/admin/site-settings', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -63,8 +63,12 @@ export const SiteSettingsView: React.FC = () => {
           },
           body: JSON.stringify(payload),
         });
+        if (!res.ok) {
+          const errBody = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(errBody.error || 'সাইট সেটিংস সেভ করা যায়নি।');
+        }
       } else {
-        await fetch('/api/admin/site-settings', {
+        const res = await fetch('/api/admin/site-settings', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -72,6 +76,10 @@ export const SiteSettingsView: React.FC = () => {
           },
           body: JSON.stringify(payload),
         });
+        if (!res.ok) {
+          const errBody = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(errBody.error || 'সাইট সেটিংস সেভ করা যায়নি।');
+        }
       }
 
       await refreshAll();

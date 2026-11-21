@@ -51,7 +51,7 @@ function isMissingTableError(err: { message?: string; code?: string } | null | u
     err.code === 'PGRST205' ||
     err.code === '42P01' ||
     msg.includes('could not find the table') ||
-    msg.includes('does not exist')
+    (msg.includes('relation') && msg.includes('does not exist'))
   );
 }
 
@@ -120,6 +120,54 @@ function getBearerToken(req: Request): string | null {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) return null;
   return header.slice(7).trim();
+}
+
+async function getSupabaseUserBankCard(uid: string): Promise<ServerBankCard | null> {
+  if (!supabaseAdmin || !isUuid(uid)) return null;
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.getUserById(uid);
+    if (error || !data?.user) return null;
+    const card = (data.user.user_metadata as Record<string, unknown> | undefined)?.bank_card;
+    if (card && typeof card === 'object' && 'wallet_method' in card && 'wallet_number' in card) {
+      return card as ServerBankCard;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function setSupabaseUserBankCard(uid: string, card: ServerBankCard): Promise<string | null> {
+  if (!supabaseAdmin || !isUuid(uid)) return 'Supabase admin unavailable';
+  try {
+    const { data } = await supabaseAdmin.auth.admin.getUserById(uid);
+    const existingMeta =
+      (data?.user?.user_metadata as Record<string, unknown> | undefined) || {};
+    const { error } = await supabaseAdmin.auth.admin.updateUserById(uid, {
+      user_metadata: { ...existingMeta, bank_card: card },
+    });
+    return error ? error.message : null;
+  } catch (err) {
+    return (err as Error).message;
+  }
+}
+
+async function getAllSupabaseBankCards(): Promise<Record<string, ServerBankCard>> {
+  const result: Record<string, ServerBankCard> = {};
+  if (!supabaseAdmin) return result;
+  try {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
+    if (error || !data?.users) return result;
+    for (const u of data.users) {
+      const card = (u.user_metadata as Record<string, unknown> | undefined)?.bank_card;
+      if (card && typeof card === 'object' && 'wallet_method' in card && 'wallet_number' in card) {
+        result[u.id] = card as ServerBankCard;
+      }
+    }
+  } catch {
+    // Ignore transient listUsers error
+  }
+  return result;
 }
 
 // =========================================================================
@@ -995,7 +1043,7 @@ async function startServer() {
         if (!profCheck) {
           const scaniaId = `SCN${Math.floor(100000 + Math.random() * 900000)}`;
           const refCode = `SCN${uid.replace(/-/g, '').slice(0, 6).toUpperCase()}`;
-          await supabaseAdmin.from('profiles').insert({
+          const { error: insProfErr } = await supabaseAdmin.from('profiles').insert({
             id: uid,
             scania_id: scaniaId,
             email,
@@ -1006,10 +1054,21 @@ async function startServer() {
             demo_balance: 150,
             demo_bonus: 150,
           });
+          if (insProfErr) {
+            res.status(400).json({ error: `Profile setup failed: ${insProfErr.message}` });
+            return;
+          }
           await supabaseAdmin.from('user_roles').upsert({ user_id: uid, role: 'user' }, { onConflict: 'user_id' });
         } else if (referrerId && !profCheck.referred_by) {
           await supabaseAdmin.from('profiles').update({ referred_by: referrerId }).eq('id', uid);
         }
+
+        await supabaseAdmin.from('notifications').insert({
+          user_id: uid,
+          title: 'SCANIA তে স্বাগতম! 150 টাকা বোনাস যুক্ত হয়েছে',
+          message: 'নতুন অ্যাকাউন্ট খোলার জন্য 150 টাকা রেজিস্ট্রেশন বোনাস আপনার ব্যালেন্সে যোগ করা হয়েছে।',
+          category: 'bonus',
+        });
 
         if (referrerId && referrerId !== uid) {
           await supabaseAdmin.from('referral_records').upsert(
@@ -1195,7 +1254,7 @@ async function startServer() {
       return;
     }
 
-    if (!rawPhone.includes('@')) {
+    if (!rawPhone.includes('@') && !supabaseAdmin) {
       const canonicalDigits = toCanonicalDigits(rawPhone);
       const rawDigits = normalizePhoneDigits(rawPhone);
       const members = readServerMembers();
@@ -1227,10 +1286,15 @@ async function startServer() {
       }
     }
 
-    res.status(404).json({ ok: false, trySupabase: true });
+    if (supabasePublic || supabaseAdmin) {
+      res.json({ ok: false, trySupabase: true });
+      return;
+    }
+
+    res.status(401).json({ error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' });
   });
 
-  app.get('/api/auth/me', (req: Request, res: Response) => {
+  app.get('/api/auth/me', async (req: Request, res: Response) => {
     const token = getBearerToken(req);
     if (!token) {
       res.status(401).json({ error: 'Missing session token.' });
@@ -1240,6 +1304,21 @@ async function startServer() {
     if (!uid) {
       res.status(401).json({ error: 'Invalid or expired session token.' });
       return;
+    }
+    if (supabaseAdmin && isUuid(uid)) {
+      const { data: prof } = await supabaseAdmin
+        .from('profiles')
+        .select('*')
+        .eq('id', uid)
+        .maybeSingle();
+      if (prof) {
+        if (prof.is_active === false) {
+          res.status(403).json({ error: 'অ্যাকাউন্টটি নিষ্ক্রিয় করা হয়েছে।' });
+          return;
+        }
+        res.json({ ok: true, profile: prof });
+        return;
+      }
     }
     const members = readServerMembers();
     const member = members.find((m) => m.id === uid);
@@ -1353,10 +1432,12 @@ async function startServer() {
           refMap = new Map((refProfs || []).map((p: any) => [p.id, p]));
         }
 
+        const bankCard = store.bankCards[uid] || (await getSupabaseUserBankCard(uid));
+
         res.json({
           ok: true,
           profile: profRes.data || null,
-          bankCard: store.bankCards[uid] || null,
+          bankCard: bankCard || null,
           transactions: txRes.data || [],
           userProducts: prodRes.data || [],
           notifications: notifRes.data || [],
@@ -1413,7 +1494,7 @@ async function startServer() {
     });
   });
 
-  app.post('/api/user/bank-card', requireUserSession, (req: AuthedRequest, res: Response) => {
+  app.post('/api/user/bank-card', requireUserSession, async (req: AuthedRequest, res: Response) => {
     const uid = req.userId!;
     const walletMethod = req.body?.wallet_method === 'Nagad' ? 'Nagad' : req.body?.wallet_method === 'Bkash' ? 'Bkash' : null;
     const walletNumber = String(req.body?.wallet_number || '').trim();
@@ -1439,6 +1520,15 @@ async function startServer() {
       account_name: accountName.slice(0, 80),
       updated_at: new Date().toISOString(),
     };
+
+    if (req.authMode === 'supabase' && supabaseAdmin && isUuid(uid)) {
+      const saveErr = await setSupabaseUserBankCard(uid, card);
+      if (saveErr) {
+        res.status(400).json({ error: `ব্যাংক কার্ড সংরক্ষণ করা যায়নি: ${saveErr}` });
+        return;
+      }
+    }
+
     store.bankCards[uid] = card;
     writeAppData(store);
     broadcastRefresh('bank_card_updated');
@@ -1549,11 +1639,15 @@ async function startServer() {
     }
 
     const store = readAppData();
+    const resolvedBankCard =
+      store.bankCards[uid] ||
+      (req.authMode === 'supabase' && supabaseAdmin && isUuid(uid)
+        ? await getSupabaseUserBankCard(uid)
+        : null);
 
     // Withdrawal strict checks: Bank Card + at least 1 purchased plan
     if (type === 'withdraw_demo') {
-      const card = store.bankCards[uid];
-      if (!card) {
+      if (!resolvedBankCard) {
         res.status(400).json({ error: 'ব্যাংক কার্ড সেটআপ না থাকলে উত্তোলন করা যাবে না।' });
         return;
       }
@@ -1689,7 +1783,7 @@ async function startServer() {
       }
     }
 
-    const bankCard = store.bankCards[uid];
+    const bankCard = resolvedBankCard;
     const fee = type === 'withdraw_demo' ? Number((parsedAmount * 0.05).toFixed(2)) : 0;
     const net = Number((parsedAmount - fee).toFixed(2));
     const txMethod =
@@ -2264,6 +2358,8 @@ async function startServer() {
             };
           });
 
+          const sbBankCards = await getAllSupabaseBankCards();
+
           res.json({
             ok: true,
             mode: 'supabase',
@@ -2272,7 +2368,7 @@ async function startServer() {
             transactions: sbTransactions,
             referrals: sbReferrals,
             userProducts: prodRes.data || [],
-            bankCards: store.bankCards,
+            bankCards: { ...store.bankCards, ...sbBankCards },
             bonusCodes: bonusRes.data || [],
             announcements: annRes.data || store.announcements,
             plans: plansRes.data && plansRes.data.length > 0 ? plansRes.data : store.plans || DEFAULT_SERVER_PLANS,

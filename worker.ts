@@ -631,7 +631,11 @@ function getSupabaseConfig(env: Env): WorkerSupabaseConfig {
 
 function isMissingTableMsg(msg: string): boolean {
   const lower = msg.toLowerCase();
-  return lower.includes('could not find the table') || lower.includes('does not exist') || lower.includes('pgrst205');
+  return (
+    lower.includes('could not find the table') ||
+    lower.includes('pgrst205') ||
+    (lower.includes('relation') && lower.includes('does not exist'))
+  );
 }
 
 async function sbRest<T = unknown>(
@@ -696,6 +700,128 @@ async function sbGetAuthUser(cfg: WorkerSupabaseConfig, jwt: string): Promise<{ 
   } catch {
     return null;
   }
+}
+
+async function sbRpc<T = unknown>(
+  cfg: WorkerSupabaseConfig,
+  fnName: string,
+  args: Record<string, unknown>,
+  useService = false
+): Promise<{ data: T | null; error: string | null }> {
+  const key = useService ? cfg.serviceKey : cfg.anonKey;
+  if (!cfg.url || !key) return { data: null, error: 'Supabase not configured' };
+  try {
+    const res = await fetch(`${cfg.url}/rest/v1/rpc/${encodeURIComponent(fnName)}`, {
+      method: 'POST',
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(args),
+    });
+    const text = await res.text();
+    let parsed: unknown = null;
+    if (text) {
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+    }
+    if (!res.ok) {
+      const errMsg =
+        parsed && typeof parsed === 'object' && 'message' in parsed
+          ? String((parsed as { message: unknown }).message)
+          : text || `RPC failed (${res.status})`;
+      return { data: null, error: errMsg };
+    }
+    return { data: parsed as T, error: null };
+  } catch (err) {
+    return { data: null, error: (err as Error).message };
+  }
+}
+
+async function sbGetUserBankCard(cfg: WorkerSupabaseConfig, uid: string): Promise<WorkerBankCard | null> {
+  if (!cfg.adminReady || !isUuid(uid)) return null;
+  try {
+    const res = await fetch(`${cfg.url}/auth/v1/admin/users/${encodeURIComponent(uid)}`, {
+      headers: {
+        apikey: cfg.serviceKey,
+        Authorization: `Bearer ${cfg.serviceKey}`,
+      },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { user_metadata?: Record<string, unknown> };
+    const card = data.user_metadata?.bank_card;
+    if (card && typeof card === 'object' && 'wallet_method' in card && 'wallet_number' in card) {
+      return card as WorkerBankCard;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function sbSetUserBankCard(
+  cfg: WorkerSupabaseConfig,
+  uid: string,
+  card: WorkerBankCard
+): Promise<string | null> {
+  if (!cfg.adminReady || !isUuid(uid)) return 'Supabase admin unavailable';
+  try {
+    let existingMeta: Record<string, unknown> = {};
+    const getRes = await fetch(`${cfg.url}/auth/v1/admin/users/${encodeURIComponent(uid)}`, {
+      headers: {
+        apikey: cfg.serviceKey,
+        Authorization: `Bearer ${cfg.serviceKey}`,
+      },
+    });
+    if (getRes.ok) {
+      const u = (await getRes.json()) as { user_metadata?: Record<string, unknown> };
+      existingMeta = u.user_metadata || {};
+    }
+    const putRes = await fetch(`${cfg.url}/auth/v1/admin/users/${encodeURIComponent(uid)}`, {
+      method: 'PUT',
+      headers: {
+        apikey: cfg.serviceKey,
+        Authorization: `Bearer ${cfg.serviceKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ user_metadata: { ...existingMeta, bank_card: card } }),
+    });
+    if (!putRes.ok) {
+      const errJson = (await putRes.json().catch(() => ({}))) as { msg?: string; message?: string };
+      return errJson.msg || errJson.message || `HTTP ${putRes.status}`;
+    }
+    return null;
+  } catch (err) {
+    return (err as Error).message;
+  }
+}
+
+async function sbGetAllBankCards(cfg: WorkerSupabaseConfig): Promise<Record<string, WorkerBankCard>> {
+  const result: Record<string, WorkerBankCard> = {};
+  if (!cfg.adminReady) return result;
+  try {
+    const res = await fetch(`${cfg.url}/auth/v1/admin/users?page=1&per_page=1000`, {
+      headers: {
+        apikey: cfg.serviceKey,
+        Authorization: `Bearer ${cfg.serviceKey}`,
+      },
+    });
+    if (!res.ok) return result;
+    const data = (await res.json()) as { users?: Array<{ id: string; user_metadata?: Record<string, unknown> }> };
+    for (const u of data.users || []) {
+      const card = u.user_metadata?.bank_card;
+      if (card && typeof card === 'object' && 'wallet_method' in card && 'wallet_number' in card) {
+        result[u.id] = card as WorkerBankCard;
+      }
+    }
+  } catch {
+    // Ignore transient list error
+  }
+  return result;
 }
 
 async function sbSignInPassword(
@@ -931,114 +1057,168 @@ export default {
           message?: string;
         };
 
-        if (createRes.ok) {
-          const uid = createdJson.id || createdJson.user?.id;
-          if (uid) {
-            const profCheck = await sbRest<{ id: string; referred_by?: string | null }[]>(
+        let uid: string | undefined = createdJson.id || createdJson.user?.id;
+        let finalEmail = sbEmail;
+
+        if (!createRes.ok) {
+          const errMsg = (createdJson.msg || createdJson.message || '').toLowerCase();
+          if (errMsg.includes('already') || errMsg.includes('registered') || errMsg.includes('exists')) {
+            return jsonResponse({ error: 'এই নম্বরটি ইতিমধ্যে নিবন্ধিত। অনুগ্রহ করে লগইন করুন।' }, 409);
+          }
+          const rpcRes = await sbRpc<{ user_id?: string; email?: string }>(
+            sb,
+            'register_phone_user',
+            { p_phone: rawPhone, p_password: password, p_referral_code: referralCode },
+            true
+          );
+          if (rpcRes.error) {
+            const rLower = rpcRes.error.toLowerCase();
+            if (rLower.includes('already registered') || rLower.includes('duplicate')) {
+              return jsonResponse({ error: 'এই নম্বরটি ইতিমধ্যে নিবন্ধিত। অনুগ্রহ করে লগইন করুন।' }, 409);
+            }
+            return jsonResponse(
+              {
+                error: `Supabase নিবন্ধন ব্যর্থ হয়েছে (${createdJson.msg || createdJson.message || rpcRes.error})। অনুগ্রহ করে SQL Editor-এ schema.sql চালান।`,
+              },
+              400
+            );
+          }
+          uid = rpcRes.data?.user_id ? String(rpcRes.data.user_id) : undefined;
+          if (rpcRes.data?.email) finalEmail = String(rpcRes.data.email);
+        }
+
+        if (uid) {
+          const profCheck = await sbRest<{ id: string; referred_by?: string | null }[]>(
+            sb,
+            `profiles?select=id,referred_by&id=eq.${encodeURIComponent(uid)}&limit=1`,
+            { useService: true }
+          );
+          const existingProf = profCheck.data?.[0];
+          let referrerId: string | null = existingProf?.referred_by ?? null;
+          if (!referrerId && referralCode) {
+            const refProf = await sbRest<{ id: string }[]>(
               sb,
-              `profiles?select=id,referred_by&id=eq.${encodeURIComponent(uid)}&limit=1`,
+              `profiles?select=id&referral_code=ilike.${encodeURIComponent(referralCode)}&limit=1`,
               { useService: true }
             );
-            const existingProf = profCheck.data?.[0];
-            let referrerId: string | null = existingProf?.referred_by ?? null;
-            if (!referrerId && referralCode) {
-              const refProf = await sbRest<{ id: string }[]>(
-                sb,
-                `profiles?select=id&referral_code=ilike.${encodeURIComponent(referralCode)}&limit=1`,
-                { useService: true }
-              );
-              referrerId = refProf.data?.[0]?.id ?? null;
+            referrerId = refProf.data?.[0]?.id ?? null;
+          }
+          if (!existingProf) {
+            const scaniaId = `SCN${Math.floor(100000 + Math.random() * 900000)}`;
+            const refCode = `SCN${uid.replace(/-/g, '').slice(0, 6).toUpperCase()}`;
+            const insProf = await sbRest(sb, 'profiles', {
+              method: 'POST',
+              useService: true,
+              body: {
+                id: uid,
+                scania_id: scaniaId,
+                email: finalEmail,
+                full_name: displayName,
+                phone: rawPhone,
+                referral_code: refCode,
+                referred_by: referrerId,
+                demo_balance: 150,
+                demo_bonus: 150,
+              },
+            });
+            if (insProf.error) {
+              return jsonResponse({ error: `Profile setup failed: ${insProf.error}` }, 400);
             }
-            if (!existingProf) {
-              const scaniaId = `SCN${Math.floor(100000 + Math.random() * 900000)}`;
-              const refCode = `SCN${uid.replace(/-/g, '').slice(0, 6).toUpperCase()}`;
-              await sbRest(sb, 'profiles', {
-                method: 'POST',
-                useService: true,
-                body: {
-                  id: uid,
-                  scania_id: scaniaId,
-                  email: sbEmail,
-                  full_name: displayName,
-                  phone: rawPhone,
-                  referral_code: refCode,
-                  referred_by: referrerId,
-                  demo_balance: 150,
-                  demo_bonus: 150,
-                },
-              });
-              await sbRest(sb, 'user_roles?on_conflict=user_id', {
-                method: 'POST',
-                useService: true,
-                prefer: 'resolution=ignore-duplicates',
-                body: { user_id: uid, role: 'user' },
-              });
-            } else if (referrerId && !existingProf.referred_by) {
-              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(uid)}`, {
-                method: 'PATCH',
-                useService: true,
-                body: { referred_by: referrerId },
-              });
-            }
-            if (referrerId && referrerId !== uid) {
+            await sbRest(sb, 'user_roles?on_conflict=user_id', {
+              method: 'POST',
+              useService: true,
+              prefer: 'resolution=ignore-duplicates',
+              body: { user_id: uid, role: 'user' },
+            });
+          } else if (referrerId && !existingProf.referred_by) {
+            await sbRest(sb, `profiles?id=eq.${encodeURIComponent(uid)}`, {
+              method: 'PATCH',
+              useService: true,
+              body: { referred_by: referrerId },
+            });
+          }
+
+          await sbRest(sb, 'notifications', {
+            method: 'POST',
+            useService: true,
+            body: {
+              user_id: uid,
+              title: 'SCANIA তে স্বাগতম! 150 টাকা বোনাস যুক্ত হয়েছে',
+              message: 'নতুন অ্যাকাউন্ট খোলার জন্য 150 টাকা রেজিস্ট্রেশন বোনাস আপনার ব্যালেন্সে যোগ করা হয়েছে।',
+              category: 'bonus',
+            },
+          });
+
+          if (referrerId && referrerId !== uid) {
+            await sbRest(sb, 'referral_records?on_conflict=referrer_id,referred_user_id', {
+              method: 'POST',
+              useService: true,
+              prefer: 'resolution=ignore-duplicates',
+              body: {
+                referrer_id: referrerId,
+                referred_user_id: uid,
+                level: 1,
+                commission_rate: 25,
+                simulated_commission: 0,
+              },
+            });
+            const l1Prof = await sbRest<{ referred_by: string | null }[]>(
+              sb,
+              `profiles?select=referred_by&id=eq.${encodeURIComponent(referrerId)}&limit=1`,
+              { useService: true }
+            );
+            const l2Id = l1Prof.data?.[0]?.referred_by;
+            if (l2Id && l2Id !== uid) {
               await sbRest(sb, 'referral_records?on_conflict=referrer_id,referred_user_id', {
                 method: 'POST',
                 useService: true,
                 prefer: 'resolution=ignore-duplicates',
                 body: {
-                  referrer_id: referrerId,
+                  referrer_id: l2Id,
                   referred_user_id: uid,
-                  level: 1,
-                  commission_rate: 25,
+                  level: 2,
+                  commission_rate: 2,
                   simulated_commission: 0,
                 },
               });
-              const l1Prof = await sbRest<{ referred_by: string | null }[]>(
+              const l2Prof = await sbRest<{ referred_by: string | null }[]>(
                 sb,
-                `profiles?select=referred_by&id=eq.${encodeURIComponent(referrerId)}&limit=1`,
+                `profiles?select=referred_by&id=eq.${encodeURIComponent(l2Id)}&limit=1`,
                 { useService: true }
               );
-              const l2Id = l1Prof.data?.[0]?.referred_by;
-              if (l2Id && l2Id !== uid) {
+              const l3Id = l2Prof.data?.[0]?.referred_by;
+              if (l3Id && l3Id !== uid) {
                 await sbRest(sb, 'referral_records?on_conflict=referrer_id,referred_user_id', {
                   method: 'POST',
                   useService: true,
                   prefer: 'resolution=ignore-duplicates',
                   body: {
-                    referrer_id: l2Id,
+                    referrer_id: l3Id,
                     referred_user_id: uid,
-                    level: 2,
-                    commission_rate: 2,
+                    level: 3,
+                    commission_rate: 1,
                     simulated_commission: 0,
                   },
                 });
-                const l2Prof = await sbRest<{ referred_by: string | null }[]>(
-                  sb,
-                  `profiles?select=referred_by&id=eq.${encodeURIComponent(l2Id)}&limit=1`,
-                  { useService: true }
-                );
-                const l3Id = l2Prof.data?.[0]?.referred_by;
-                if (l3Id && l3Id !== uid) {
-                  await sbRest(sb, 'referral_records?on_conflict=referrer_id,referred_user_id', {
-                    method: 'POST',
-                    useService: true,
-                    prefer: 'resolution=ignore-duplicates',
-                    body: {
-                      referrer_id: l3Id,
-                      referred_user_id: uid,
-                      level: 3,
-                      commission_rate: 1,
-                      simulated_commission: 0,
-                    },
-                  });
-                }
               }
             }
           }
-          return jsonResponse({ ok: true, mode: 'supabase', email: sbEmail });
-        } else {
-          const errMsg = (createdJson.msg || createdJson.message || '').toLowerCase();
-          if (errMsg.includes('already') || errMsg.includes('registered') || errMsg.includes('exists')) {
+        }
+        return jsonResponse({ ok: true, mode: 'supabase', email: finalEmail });
+      }
+      if (sb.publicReady) {
+        const rpcRes = await sbRpc<{ email?: string }>(
+          sb,
+          'register_phone_user',
+          { p_phone: rawPhone, p_password: password, p_referral_code: referralCode },
+          false
+        );
+        if (!rpcRes.error && rpcRes.data) {
+          return jsonResponse({ ok: true, mode: 'supabase', email: rpcRes.data.email || sbEmail });
+        }
+        if (rpcRes.error) {
+          const msg = rpcRes.error.toLowerCase();
+          if (msg.includes('already registered') || msg.includes('duplicate')) {
             return jsonResponse({ error: 'এই নম্বরটি ইতিমধ্যে নিবন্ধিত। অনুগ্রহ করে লগইন করুন।' }, 409);
           }
         }
@@ -1163,47 +1343,49 @@ export default {
         return jsonResponse({ error: 'মোবাইল নম্বর এবং পাসওয়ার্ড দিন।' }, 400);
       }
 
-      const canonicalDigits = toCanonicalDigits(rawPhone);
-      const rawDigits = normalizePhoneDigits(rawPhone);
-      const member = state.members.find(
-        (m) =>
-          m.canonical_digits === canonicalDigits ||
-          m.canonical_digits === rawDigits ||
-          m.phone === rawPhone
-      );
-
-      if (member) {
-        if (!member.is_active) {
-          return jsonResponse({ error: 'অ্যাকাউন্টটি নিষ্ক্রিয় করা হয়েছে।' }, 403);
-        }
-        const expected = await sha256Hex(`${member.password_salt}:${password}`);
-        if (expected !== member.password_hash) {
-          return jsonResponse({ error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' }, 401);
-        }
-
-        const token = await signWorkerToken(
-          {
-            uid: member.id,
-            role: 'user',
-            phone: member.phone,
-            name: member.full_name,
-            scania_id: member.scania_id,
-            ref_code: member.referral_code,
-          },
-          secret
+      if (!sb.adminReady) {
+        const canonicalDigits = toCanonicalDigits(rawPhone);
+        const rawDigits = normalizePhoneDigits(rawPhone);
+        const member = state.members.find(
+          (m) =>
+            m.canonical_digits === canonicalDigits ||
+            m.canonical_digits === rawDigits ||
+            m.phone === rawPhone
         );
 
-        return jsonResponse({
-          ok: true,
-          mode: 'server',
-          runtime: 'cloudflare-worker',
-          token,
-          profile: sanitizeMemberProfile(member),
-        });
+        if (member) {
+          if (!member.is_active) {
+            return jsonResponse({ error: 'অ্যাকাউন্টটি নিষ্ক্রিয় করা হয়েছে।' }, 403);
+          }
+          const expected = await sha256Hex(`${member.password_salt}:${password}`);
+          if (expected !== member.password_hash) {
+            return jsonResponse({ error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' }, 401);
+          }
+
+          const token = await signWorkerToken(
+            {
+              uid: member.id,
+              role: 'user',
+              phone: member.phone,
+              name: member.full_name,
+              scania_id: member.scania_id,
+              ref_code: member.referral_code,
+            },
+            secret
+          );
+
+          return jsonResponse({
+            ok: true,
+            mode: 'server',
+            runtime: 'cloudflare-worker',
+            token,
+            profile: sanitizeMemberProfile(member),
+          });
+        }
       }
 
       if (sb.publicReady || sb.adminReady) {
-        return jsonResponse({ ok: false, trySupabase: true }, 404);
+        return jsonResponse({ ok: false, trySupabase: true }, 200);
       }
 
       return jsonResponse({ error: 'মোবাইল নম্বর অথবা পাসওয়ার্ড সঠিক নয়।' }, 401);
@@ -1214,17 +1396,30 @@ export default {
       const rawInput = String(body.phoneOrEmail || '').trim();
       if (!rawInput) return jsonResponse({ error: 'Phone number is required.' }, 400);
       if (rawInput.includes('@')) return jsonResponse({ email: rawInput });
+      const rawDigits = normalizePhoneDigits(rawInput);
       const canonical = toCanonicalDigits(rawInput);
       const defaultEmail = `u${canonical}@scania-member.com`;
+      const altEmail = `u${rawDigits}@scania-member.com`;
 
       if (sb.adminReady) {
         const profRes = await sbRest<{ id: string; email: string }[]>(
           sb,
-          `profiles?select=id,email&or=(email.eq.${encodeURIComponent(defaultEmail)},phone.eq.${encodeURIComponent(rawInput)},phone.eq.${encodeURIComponent(canonical)})&limit=1`,
+          `profiles?select=id,email&or=(email.eq.${encodeURIComponent(defaultEmail)},email.eq.${encodeURIComponent(altEmail)},phone.eq.${encodeURIComponent(rawInput)},phone.eq.${encodeURIComponent(canonical)},phone.eq.${encodeURIComponent(rawDigits)})&limit=1`,
           { useService: true }
         );
         const found = profRes.data?.[0];
-        if (found?.email) {
+        if (found?.id && found?.email) {
+          if (found.email.endsWith('@scania-member.com')) {
+            await fetch(`${sb.url}/auth/v1/admin/users/${encodeURIComponent(found.id)}`, {
+              method: 'PUT',
+              headers: {
+                apikey: sb.serviceKey,
+                Authorization: `Bearer ${sb.serviceKey}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ email_confirm: true }),
+            }).catch(() => {});
+          }
           return jsonResponse({ email: found.email });
         }
       }
@@ -1236,6 +1431,24 @@ export default {
       if (!token) return jsonResponse({ error: 'Missing session token.' }, 401);
       const claims = await verifyWorkerToken(token, secret);
       if (!claims) return jsonResponse({ error: 'Invalid or expired session token.' }, 401);
+      if (sb.adminReady && isUuid(claims.uid)) {
+        const profRes = await sbRest<Record<string, unknown>[]>(
+          sb,
+          `profiles?select=*&id=eq.${encodeURIComponent(claims.uid)}&limit=1`,
+          { useService: true }
+        );
+        const prof = profRes.data?.[0];
+        if (prof) {
+          if (prof.is_active === false) {
+            return jsonResponse({ error: 'অ্যাকাউন্টটি নিষ্ক্রিয় করা হয়েছে।' }, 403);
+          }
+          return jsonResponse({
+            ok: true,
+            runtime: 'cloudflare-worker',
+            profile: prof,
+          });
+        }
+      }
       const member = ensureMemberFromClaims(state, claims);
       return jsonResponse({
         ok: true,
@@ -1306,10 +1519,12 @@ export default {
             }
           }
 
+          const bankCard = state.bankCards[uid] || (await sbGetUserBankCard(sb, uid));
+
           return jsonResponse({
             ok: true,
             profile: profRes.data?.[0] || null,
-            bankCard: state.bankCards[uid] || null,
+            bankCard: bankCard || null,
             transactions: txRes.data || [],
             userProducts: prodRes.data || [],
             notifications: notifRes.data || [],
@@ -1376,6 +1591,12 @@ export default {
         account_name: accountName.slice(0, 80),
         updated_at: new Date().toISOString(),
       };
+      if (claims.authMode === 'supabase' && sb.adminReady && isUuid(claims.uid)) {
+        const saveErr = await sbSetUserBankCard(sb, claims.uid, card);
+        if (saveErr) {
+          return jsonResponse({ error: `ব্যাংক কার্ড সংরক্ষণ করা যায়নি: ${saveErr}` }, 400);
+        }
+      }
       state.bankCards[claims.uid] = card;
       await saveState(state);
       return jsonResponse({ ok: true, bankCard: card });
@@ -1468,7 +1689,7 @@ export default {
         if (!prof || !prof.is_active) {
           return jsonResponse({ error: 'অ্যাকাউন্ট সক্রিয় নয় বা পাওয়া যায়নি।' }, 403);
         }
-        const bankCard = state.bankCards[uid];
+        const bankCard = state.bankCards[uid] || (await sbGetUserBankCard(sb, uid));
         if (type === 'withdraw_demo') {
           if (parsedAmount < 150) return jsonResponse({ error: 'সর্বনিম্ন উত্তোলন 150 টাকা।' }, 400);
           if (!bankCard) {
@@ -2029,6 +2250,8 @@ export default {
             };
           });
 
+          const sbBankCards = await sbGetAllBankCards(sb);
+
           return jsonResponse({
             ok: true,
             mode: 'supabase',
@@ -2037,7 +2260,7 @@ export default {
             transactions: sbTransactions,
             referrals: sbReferrals,
             userProducts: prodRes.data || [],
-            bankCards: state.bankCards,
+            bankCards: { ...state.bankCards, ...sbBankCards },
             bonusCodes: bonusRes.data || [],
             announcements: annRes.data || state.announcements,
             plans: plansRes.data && plansRes.data.length > 0 ? plansRes.data : state.plans || DEFAULT_PLANS,
@@ -2105,12 +2328,16 @@ export default {
       await saveState(state);
 
       if (sb.adminReady) {
-        await sbRest(sb, 'site_settings?on_conflict=id', {
+        const sbRes = await sbRest<WorkerSiteSettings[]>(sb, 'site_settings?on_conflict=id', {
           method: 'POST',
           useService: true,
           prefer: 'resolution=merge-duplicates,return=representation',
           body: updated,
         });
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        return jsonResponse({ ok: true, siteSettings: sbRes.data?.[0] || updated });
       }
 
       return jsonResponse({ ok: true, siteSettings: updated });
@@ -2154,7 +2381,10 @@ export default {
           prefer: 'return=representation',
           body: insertPayload,
         });
-        if (!sbRes.error && sbRes.data?.[0]) {
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        if (sbRes.data?.[0]) {
           return jsonResponse({ ok: true, plan: sbRes.data[0] });
         }
       }
@@ -2170,10 +2400,14 @@ export default {
       const planId = pathname.split('/').pop() || '';
       if (method === 'DELETE') {
         if (sb.adminReady && isUuid(planId)) {
-          await sbRest(sb, `plans?id=eq.${encodeURIComponent(planId)}`, {
+          const delRes = await sbRest(sb, `plans?id=eq.${encodeURIComponent(planId)}`, {
             method: 'DELETE',
             useService: true,
           });
+          if (delRes.error) {
+            return jsonResponse({ error: delRes.error }, 400);
+          }
+          return jsonResponse({ ok: true });
         }
         const list = state.plans && state.plans.length > 0 ? [...state.plans] : [...DEFAULT_PLANS];
         state.plans = list.filter((p) => p.id !== planId);
@@ -2201,9 +2435,13 @@ export default {
           prefer: 'return=representation',
           body: patch,
         });
-        if (!sbRes.error && sbRes.data?.[0]) {
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        if (sbRes.data?.[0]) {
           return jsonResponse({ ok: true, plan: sbRes.data[0] });
         }
+        return jsonResponse({ error: 'Plan not found.' }, 404);
       }
 
       const list = state.plans && state.plans.length > 0 ? [...state.plans] : [...DEFAULT_PLANS];
@@ -2255,7 +2493,10 @@ export default {
           prefer: 'return=representation',
           body: insertPayload,
         });
-        if (!sbRes.error && sbRes.data?.[0]) {
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        if (sbRes.data?.[0]) {
           return jsonResponse({ ok: true, bonusCode: sbRes.data[0] });
         }
       }
@@ -2270,7 +2511,11 @@ export default {
       const id = pathname.split('/').pop() || '';
       if (method === 'DELETE') {
         if (sb.adminReady && isUuid(id)) {
-          await sbRest(sb, `bonus_codes?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+          const delRes = await sbRest(sb, `bonus_codes?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+          if (delRes.error) {
+            return jsonResponse({ error: delRes.error }, 400);
+          }
+          return jsonResponse({ ok: true });
         }
         state.bonusCodes = state.bonusCodes.filter((b) => b.id !== id);
         await saveState(state);
@@ -2290,9 +2535,13 @@ export default {
           prefer: 'return=representation',
           body: patch,
         });
-        if (!sbRes.error && sbRes.data?.[0]) {
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        if (sbRes.data?.[0]) {
           return jsonResponse({ ok: true, bonusCode: sbRes.data[0] });
         }
+        return jsonResponse({ error: 'Bonus code not found.' }, 404);
       }
 
       const idx = state.bonusCodes.findIndex((b) => b.id === id);
@@ -2333,7 +2582,10 @@ export default {
           prefer: 'return=representation',
           body: insertPayload,
         });
-        if (!sbRes.error && sbRes.data?.[0]) {
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        if (sbRes.data?.[0]) {
           return jsonResponse({ ok: true, announcement: sbRes.data[0] });
         }
       }
@@ -2349,7 +2601,11 @@ export default {
       const id = pathname.split('/').pop() || '';
       if (method === 'DELETE') {
         if (sb.adminReady && isUuid(id)) {
-          await sbRest(sb, `announcements?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+          const delRes = await sbRest(sb, `announcements?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+          if (delRes.error) {
+            return jsonResponse({ error: delRes.error }, 400);
+          }
+          return jsonResponse({ ok: true });
         }
         state.announcements = (state.announcements || []).filter((a) => a.id !== id);
         await saveState(state);
@@ -2368,9 +2624,13 @@ export default {
           prefer: 'return=representation',
           body: patch,
         });
-        if (!sbRes.error && sbRes.data?.[0]) {
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        if (sbRes.data?.[0]) {
           return jsonResponse({ ok: true, announcement: sbRes.data[0] });
         }
+        return jsonResponse({ error: 'Announcement not found.' }, 404);
       }
 
       const list = state.announcements ? [...state.announcements] : [];
@@ -2408,7 +2668,10 @@ export default {
             ? [{ user_id: null, title, message, category }]
             : userIds.map((uid) => ({ user_id: String(uid), title, message, category }));
         const sbRes = await sbRest(sb, 'notifications', { method: 'POST', useService: true, body: rows });
-        if (!sbRes.error) return jsonResponse({ ok: true });
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        return jsonResponse({ ok: true });
       }
 
       if (userIds.length === 0) {
@@ -2467,7 +2730,10 @@ export default {
           prefer: 'return=representation',
           body: insertPayload,
         });
-        if (!sbRes.error && sbRes.data?.[0]) {
+        if (sbRes.error) {
+          return jsonResponse({ error: sbRes.error }, 400);
+        }
+        if (sbRes.data?.[0]) {
           return jsonResponse({ ok: true, banner: sbRes.data[0] });
         }
       }
@@ -2481,7 +2747,11 @@ export default {
       if (!(await requireAdminClaims())) return jsonResponse({ error: 'Unauthorized' }, 401);
       const id = pathname.split('/').pop() || '';
       if (sb.adminReady && isUuid(id)) {
-        await sbRest(sb, `banners?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+        const delRes = await sbRest(sb, `banners?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', useService: true });
+        if (delRes.error) {
+          return jsonResponse({ error: delRes.error }, 400);
+        }
+        return jsonResponse({ ok: true });
       }
       state.banners = state.banners.filter((b) => b.id !== id);
       await saveState(state);
@@ -2499,145 +2769,178 @@ export default {
         return jsonResponse({ error: 'Valid transactionId and decision required.' }, 400);
       }
 
-      if (sb.adminReady && isUuid(transactionId)) {
+      if (sb.adminReady) {
+        if (!isUuid(transactionId)) {
+          return jsonResponse({ error: 'Transaction not found.' }, 404);
+        }
         const txRes = await sbRest<WorkerTransaction[]>(
           sb,
           `demo_transactions?select=*&id=eq.${encodeURIComponent(transactionId)}&limit=1`,
           { useService: true }
         );
+        if (txRes.error) {
+          return jsonResponse({ error: txRes.error }, 400);
+        }
         const sbTx = txRes.data?.[0];
-        if (sbTx) {
-          if (sbTx.status !== 'pending') {
-            return jsonResponse({ error: 'Transaction has already been processed.' }, 400);
+        if (!sbTx) {
+          return jsonResponse({ error: 'Transaction not found.' }, 404);
+        }
+        if (sbTx.status !== 'pending') {
+          return jsonResponse({ error: 'Transaction has already been processed.' }, 400);
+        }
+        const nowIso = new Date().toISOString();
+        const txAmount = Number(sbTx.amount);
+
+        const profRes = await sbRest<{ id: string; demo_balance: number; referred_by: string | null; full_name: string; scania_id: string }[]>(
+          sb,
+          `profiles?select=id,demo_balance,referred_by,full_name,scania_id&id=eq.${encodeURIComponent(sbTx.user_id)}&limit=1`,
+          { useService: true }
+        );
+        if (profRes.error) {
+          return jsonResponse({ error: profRes.error }, 400);
+        }
+        const prof = profRes.data?.[0];
+        if (!prof) return jsonResponse({ error: 'User profile not found.' }, 404);
+        const currentBal = Number(prof.demo_balance || 0);
+
+        if (decision === 'approved' && sbTx.type === 'deposit_demo') {
+          const balUpd = await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
+            method: 'PATCH',
+            useService: true,
+            body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
+          });
+          if (balUpd.error) {
+            return jsonResponse({ error: balUpd.error }, 400);
           }
-          const nowIso = new Date().toISOString();
-          const txAmount = Number(sbTx.amount);
-
-          const profRes = await sbRest<{ id: string; demo_balance: number; referred_by: string | null; full_name: string; scania_id: string }[]>(
-            sb,
-            `profiles?select=id,demo_balance,referred_by,full_name,scania_id&id=eq.${encodeURIComponent(sbTx.user_id)}&limit=1`,
-            { useService: true }
-          );
-          const prof = profRes.data?.[0];
-          if (!prof) return jsonResponse({ error: 'User profile not found.' }, 404);
-          const currentBal = Number(prof.demo_balance || 0);
-
-          if (decision === 'approved' && sbTx.type === 'deposit_demo') {
-            await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
-              method: 'PATCH',
-              useService: true,
-              body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
-            });
-            if (prof.referred_by) {
-              const comm = Number((txAmount * 0.25).toFixed(2));
-              const refProfRes = await sbRest<{ id: string; demo_balance: number }[]>(
+          if (prof.referred_by) {
+            const comm = Number((txAmount * 0.25).toFixed(2));
+            const refProfRes = await sbRest<{ id: string; demo_balance: number }[]>(
+              sb,
+              `profiles?select=id,demo_balance&id=eq.${encodeURIComponent(prof.referred_by)}&limit=1`,
+              { useService: true }
+            );
+            const refProf = refProfRes.data?.[0];
+            if (refProf && comm > 0) {
+              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(refProf.id)}`, {
+                method: 'PATCH',
+                useService: true,
+                body: { demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)), updated_at: nowIso },
+              });
+              const refRecRes = await sbRest<{ id: string; simulated_commission: number }[]>(
                 sb,
-                `profiles?select=id,demo_balance&id=eq.${encodeURIComponent(prof.referred_by)}&limit=1`,
+                `referral_records?select=id,simulated_commission&referrer_id=eq.${encodeURIComponent(refProf.id)}&referred_user_id=eq.${encodeURIComponent(sbTx.user_id)}&level=eq.1&limit=1`,
                 { useService: true }
               );
-              const refProf = refProfRes.data?.[0];
-              if (refProf && comm > 0) {
-                await sbRest(sb, `profiles?id=eq.${encodeURIComponent(refProf.id)}`, {
+              const refRec = refRecRes.data?.[0];
+              if (refRec) {
+                await sbRest(sb, `referral_records?id=eq.${encodeURIComponent(refRec.id)}`, {
                   method: 'PATCH',
                   useService: true,
-                  body: { demo_balance: Number((Number(refProf.demo_balance) + comm).toFixed(2)), updated_at: nowIso },
+                  body: { simulated_commission: Number((Number(refRec.simulated_commission || 0) + comm).toFixed(2)) },
                 });
-                const refRecRes = await sbRest<{ id: string; simulated_commission: number }[]>(
-                  sb,
-                  `referral_records?select=id,simulated_commission&referrer_id=eq.${encodeURIComponent(refProf.id)}&referred_user_id=eq.${encodeURIComponent(sbTx.user_id)}&level=eq.1&limit=1`,
-                  { useService: true }
-                );
-                const refRec = refRecRes.data?.[0];
-                if (refRec) {
-                  await sbRest(sb, `referral_records?id=eq.${encodeURIComponent(refRec.id)}`, {
-                    method: 'PATCH',
-                    useService: true,
-                    body: { simulated_commission: Number((Number(refRec.simulated_commission || 0) + comm).toFixed(2)) },
-                  });
-                } else {
-                  await sbRest(sb, 'referral_records', {
-                    method: 'POST',
-                    useService: true,
-                    body: {
-                      referrer_id: refProf.id,
-                      referred_user_id: sbTx.user_id,
-                      level: 1,
-                      commission_rate: 25,
-                      simulated_commission: comm,
-                    },
-                  });
-                }
-                await sbRest(sb, 'demo_transactions', {
+              } else {
+                await sbRest(sb, 'referral_records', {
                   method: 'POST',
                   useService: true,
                   body: {
-                    user_id: refProf.id,
-                    type: 'referral_commission',
-                    amount: comm,
-                    method: 'লেভেল 1 রেফারেল (25%)',
-                    reference_code: prof.scania_id,
-                    status: 'completed',
-                    admin_note: `${prof.full_name} এর রিচার্জ থেকে 25% কমিশন`,
-                  },
-                });
-                await sbRest(sb, 'notifications', {
-                  method: 'POST',
-                  useService: true,
-                  body: {
-                    user_id: refProf.id,
-                    title: 'টিম কমিশন যুক্ত হয়েছে (25%)',
-                    message: `${prof.full_name} এর ${txAmount} টাকা রিচার্জ কনফার্ম হওয়ায় ${comm} টাকা কমিশন আপনার ব্যালেন্সে যোগ হয়েছে।`,
-                    category: 'bonus',
+                    referrer_id: refProf.id,
+                    referred_user_id: sbTx.user_id,
+                    level: 1,
+                    commission_rate: 25,
+                    simulated_commission: comm,
                   },
                 });
               }
+              await sbRest(sb, 'demo_transactions', {
+                method: 'POST',
+                useService: true,
+                body: {
+                  user_id: refProf.id,
+                  type: 'referral_commission',
+                  amount: comm,
+                  method: 'লেভেল 1 রেফারেল (25%)',
+                  reference_code: prof.scania_id,
+                  status: 'completed',
+                  admin_note: `${prof.full_name} এর রিচার্জ থেকে 25% কমিশন`,
+                },
+              });
+              await sbRest(sb, 'notifications', {
+                method: 'POST',
+                useService: true,
+                body: {
+                  user_id: refProf.id,
+                  title: 'টিম কমিশন যুক্ত হয়েছে (25%)',
+                  message: `${prof.full_name} এর ${txAmount} টাকা রিচার্জ কনফার্ম হওয়ায় ${comm} টাকা কমিশন আপনার ব্যালেন্সে যোগ হয়েছে।`,
+                  category: 'bonus',
+                },
+              });
             }
-          } else if (decision === 'rejected' && sbTx.type === 'withdraw_demo') {
-            await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
-              method: 'PATCH',
-              useService: true,
-              body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
-            });
           }
+        } else if (decision === 'rejected' && sbTx.type === 'withdraw_demo') {
+          const refundUpd = await sbRest(sb, `profiles?id=eq.${encodeURIComponent(sbTx.user_id)}`, {
+            method: 'PATCH',
+            useService: true,
+            body: { demo_balance: Number((currentBal + txAmount).toFixed(2)), updated_at: nowIso },
+          });
+          if (refundUpd.error) {
+            return jsonResponse({ error: refundUpd.error }, 400);
+          }
+        }
 
-          const updRes = await sbRest<WorkerTransaction[]>(
-            sb,
-            `demo_transactions?id=eq.${encodeURIComponent(transactionId)}`,
-            {
-              method: 'PATCH',
-              useService: true,
-              prefer: 'return=representation',
-              body: {
-                status: decision,
-                admin_note: adminNote.slice(0, 300),
-                processed_by: isUuid(admin.uid) ? admin.uid : null,
-                updated_at: nowIso,
-              },
-            }
-          );
+        const updRes = await sbRest<WorkerTransaction[]>(
+          sb,
+          `demo_transactions?id=eq.${encodeURIComponent(transactionId)}`,
+          {
+            method: 'PATCH',
+            useService: true,
+            prefer: 'return=representation',
+            body: {
+              status: decision,
+              admin_note: adminNote ? adminNote.slice(0, 300) : decision === 'approved' ? 'কনফার্ম করা হয়েছে' : 'ব্যর্থ হয়েছে',
+              processed_by: isUuid(admin.uid) ? admin.uid : null,
+              updated_at: nowIso,
+            },
+          }
+        );
+        if (updRes.error) {
+          return jsonResponse({ error: updRes.error }, 400);
+        }
 
-          const title =
-            decision === 'approved'
-              ? sbTx.type === 'deposit_demo'
-                ? 'আপনার রিচার্জ সফল হয়েছে'
-                : 'আপনার উত্তোলন সফল হয়েছে'
-              : sbTx.type === 'deposit_demo'
-              ? 'আপনার রিচার্জ ব্যর্থ হয়েছে'
-              : 'আপনার উত্তোলন বাতিল ও ব্যালেন্স ফেরত দেওয়া হয়েছে';
+        const title =
+          decision === 'approved'
+            ? sbTx.type === 'deposit_demo'
+              ? 'আপনার রিচার্জ সফল হয়েছে'
+              : 'আপনার উত্তোলন সফল হয়েছে'
+            : sbTx.type === 'deposit_demo'
+            ? 'আপনার রিচার্জ ব্যর্থ হয়েছে'
+            : 'আপনার উত্তোলন বাতিল ও ব্যালেন্স ফেরত দেওয়া হয়েছে';
 
-          await sbRest(sb, 'notifications', {
+        await sbRest(sb, 'notifications', {
+          method: 'POST',
+          useService: true,
+          body: {
+            user_id: sbTx.user_id,
+            title,
+            message: `${title} (${txAmount} টাকা)।${adminNote ? ` নোট: ${adminNote}` : ''}`,
+            category: 'transaction',
+          },
+        });
+
+        if (isUuid(admin.uid)) {
+          await sbRest(sb, 'admin_audit_logs', {
             method: 'POST',
             useService: true,
             body: {
-              user_id: sbTx.user_id,
-              title,
-              message: `${title} (${txAmount} টাকা)।${adminNote ? ` নোট: ${adminNote}` : ''}`,
-              category: 'transaction',
+              admin_id: admin.uid,
+              action: `transaction_${decision}`,
+              target_table: 'demo_transactions',
+              target_id: transactionId,
+              details: { decision, amount: txAmount, type: sbTx.type, adminNote },
             },
           });
-
-          return jsonResponse({ ok: true, transaction: updRes.data?.[0] || sbTx });
         }
+
+        return jsonResponse({ ok: true, transaction: updRes.data?.[0] || sbTx });
       }
 
       const txIdx = state.transactions.findIndex((t) => t.id === transactionId);
@@ -2746,7 +3049,10 @@ export default {
       const body = await readJsonBody(request);
       const nowIso = new Date().toISOString();
 
-      if (sb.adminReady && isUuid(targetId)) {
+      if (sb.adminReady) {
+        if (!isUuid(targetId)) {
+          return jsonResponse({ error: 'User not found.' }, 404);
+        }
         if (!action && method === 'PUT') {
           const patch: Record<string, unknown> = { updated_at: nowIso };
           if (typeof body.full_name === 'string' && body.full_name.trim()) patch.full_name = body.full_name.trim().slice(0, 80);
@@ -2758,9 +3064,20 @@ export default {
             `profiles?id=eq.${encodeURIComponent(targetId)}`,
             { method: 'PATCH', useService: true, prefer: 'return=representation', body: patch }
           );
-          if (!updRes.error && updRes.data?.[0]) {
-            return jsonResponse({ ok: true, profile: updRes.data[0] });
+          if (updRes.error) {
+            return jsonResponse({ error: updRes.error }, 400);
           }
+          if (!updRes.data?.[0]) {
+            return jsonResponse({ error: 'User not found.' }, 404);
+          }
+          if (isUuid(admin.uid)) {
+            await sbRest(sb, 'admin_audit_logs', {
+              method: 'POST',
+              useService: true,
+              body: { admin_id: admin.uid, action: 'update_user_profile', target_table: 'profiles', target_id: targetId, details: patch },
+            });
+          }
+          return jsonResponse({ ok: true, profile: updRes.data[0] });
         }
 
         if (action === 'balance' && method === 'POST') {
@@ -2775,47 +3092,67 @@ export default {
             `profiles?select=demo_balance&id=eq.${encodeURIComponent(targetId)}&limit=1`,
             { useService: true }
           );
-          const prof = profRes.data?.[0];
-          if (prof) {
-            const cur = Number(prof.demo_balance || 0);
-            if (mode === 'deduct' && cur < amount) {
-              return jsonResponse({ error: 'ব্যবহারকারীর ব্যালেন্সের চেয়ে বেশি টাকা কাটা যাবে না।' }, 400);
-            }
-            const nextBal = mode === 'add' ? Number((cur + amount).toFixed(2)) : Number((cur - amount).toFixed(2));
-            const updRes = await sbRest<Record<string, unknown>[]>(
-              sb,
-              `profiles?id=eq.${encodeURIComponent(targetId)}`,
-              { method: 'PATCH', useService: true, prefer: 'return=representation', body: { demo_balance: nextBal, updated_at: nowIso } }
-            );
-            await sbRest(sb, 'demo_transactions', {
-              method: 'POST',
-              useService: true,
-              body: {
-                user_id: targetId,
-                type: mode === 'add' ? 'bonus_code' : 'withdraw_demo',
-                amount: Number(amount.toFixed(2)),
-                method: mode === 'add' ? 'Admin Add Balance' : 'Admin Deduct Balance',
-                reference_code: 'ADMIN-ADJ',
-                status: 'completed',
-                admin_note: note || (mode === 'add' ? 'অ্যাডমিন থেকে ব্যালেন্স যোগ করা হয়েছে' : 'অ্যাডমিন থেকে ব্যালেন্স কাটা হয়েছে'),
-                processed_by: isUuid(admin.uid) ? admin.uid : null,
-              },
-            });
-            await sbRest(sb, 'notifications', {
-              method: 'POST',
-              useService: true,
-              body: {
-                user_id: targetId,
-                title: mode === 'add' ? 'ব্যালেন্স যোগ হয়েছে' : 'ব্যালেন্স সমন্বয় হয়েছে',
-                message:
-                  mode === 'add'
-                    ? `আপনার অ্যাকাউন্টে ${amount} টাকা যোগ করা হয়েছে।${note ? ` (${note})` : ''}`
-                    : `আপনার অ্যাকাউন্ট থেকে ${amount} টাকা কেটে নেওয়া হয়েছে।${note ? ` (${note})` : ''}`,
-                category: 'transaction',
-              },
-            });
-            return jsonResponse({ ok: true, profile: updRes.data?.[0] });
+          if (profRes.error) {
+            return jsonResponse({ error: profRes.error }, 400);
           }
+          const prof = profRes.data?.[0];
+          if (!prof) {
+            return jsonResponse({ error: 'User not found.' }, 404);
+          }
+          const cur = Number(prof.demo_balance || 0);
+          if (mode === 'deduct' && cur < amount) {
+            return jsonResponse({ error: 'ব্যবহারকারীর ব্যালেন্সের চেয়ে বেশি টাকা কাটা যাবে না।' }, 400);
+          }
+          const nextBal = mode === 'add' ? Number((cur + amount).toFixed(2)) : Number((cur - amount).toFixed(2));
+          const updRes = await sbRest<Record<string, unknown>[]>(
+            sb,
+            `profiles?id=eq.${encodeURIComponent(targetId)}`,
+            { method: 'PATCH', useService: true, prefer: 'return=representation', body: { demo_balance: nextBal, updated_at: nowIso } }
+          );
+          if (updRes.error) {
+            return jsonResponse({ error: updRes.error }, 400);
+          }
+          await sbRest(sb, 'demo_transactions', {
+            method: 'POST',
+            useService: true,
+            body: {
+              user_id: targetId,
+              type: mode === 'add' ? 'bonus_code' : 'withdraw_demo',
+              amount: Number(amount.toFixed(2)),
+              method: mode === 'add' ? 'Admin Add Balance' : 'Admin Deduct Balance',
+              reference_code: 'ADMIN-ADJ',
+              status: 'completed',
+              admin_note: note || (mode === 'add' ? 'অ্যাডমিন থেকে ব্যালেন্স যোগ করা হয়েছে' : 'অ্যাডমিন থেকে ব্যালেন্স কাটা হয়েছে'),
+              processed_by: isUuid(admin.uid) ? admin.uid : null,
+            },
+          });
+          await sbRest(sb, 'notifications', {
+            method: 'POST',
+            useService: true,
+            body: {
+              user_id: targetId,
+              title: mode === 'add' ? 'ব্যালেন্স যোগ হয়েছে' : 'ব্যালেন্স সমন্বয় হয়েছে',
+              message:
+                mode === 'add'
+                  ? `আপনার অ্যাকাউন্টে ${amount} টাকা যোগ করা হয়েছে।${note ? ` (${note})` : ''}`
+                  : `আপনার অ্যাকাউন্ট থেকে ${amount} টাকা কেটে নেওয়া হয়েছে।${note ? ` (${note})` : ''}`,
+              category: 'transaction',
+            },
+          });
+          if (isUuid(admin.uid)) {
+            await sbRest(sb, 'admin_audit_logs', {
+              method: 'POST',
+              useService: true,
+              body: {
+                admin_id: admin.uid,
+                action: `admin_${mode}_balance`,
+                target_table: 'profiles',
+                target_id: targetId,
+                details: { mode, amount, previous: cur, next: nextBal, note },
+              },
+            });
+          }
+          return jsonResponse({ ok: true, profile: updRes.data?.[0] });
         }
 
         if (action === 'password' && method === 'POST') {
@@ -2832,69 +3169,109 @@ export default {
             },
             body: JSON.stringify({ password: newPassword }),
           });
-          if (authRes.ok) {
-            return jsonResponse({ ok: true });
+          if (!authRes.ok) {
+            const errJson = (await authRes.json().catch(() => ({}))) as { message?: string; msg?: string; error_description?: string };
+            return jsonResponse(
+              { error: errJson.message || errJson.msg || errJson.error_description || 'পাসওয়ার্ড পরিবর্তন করা যায়নি।' },
+              400
+            );
           }
+          if (isUuid(admin.uid)) {
+            await sbRest(sb, 'admin_audit_logs', {
+              method: 'POST',
+              useService: true,
+              body: { admin_id: admin.uid, action: 'admin_reset_password', target_table: 'profiles', target_id: targetId, details: {} },
+            });
+          }
+          return jsonResponse({ ok: true });
         }
 
         if (action === 'assign-plan' && method === 'POST') {
           const planId = String(body.planId || '');
           const tier = typeof body.tier === 'string' && body.tier.trim() ? body.tier.trim().slice(0, 40) : '';
-          const planRes = await sbRest<WorkerPlan[]>(
-            sb,
-            `plans?select=*&id=eq.${encodeURIComponent(planId)}&limit=1`,
-            { useService: true }
-          );
-          const plan = planRes.data?.[0];
-          if (plan) {
-            if (tier) {
-              await sbRest(sb, `profiles?id=eq.${encodeURIComponent(targetId)}`, {
-                method: 'PATCH',
-                useService: true,
-                body: { tier, updated_at: nowIso },
-              });
+          let plan: WorkerPlan | undefined;
+          if (isUuid(planId)) {
+            const planRes = await sbRest<WorkerPlan[]>(
+              sb,
+              `plans?select=*&id=eq.${encodeURIComponent(planId)}&limit=1`,
+              { useService: true }
+            );
+            if (planRes.error) {
+              return jsonResponse({ error: planRes.error }, 400);
             }
-            const expiresAt = new Date(Date.now() + Number(plan.validity_days) * 86400000).toISOString();
-            const prodRes = await sbRest<WorkerUserProduct[]>(sb, 'demo_user_products', {
-              method: 'POST',
-              useService: true,
-              prefer: 'return=representation',
-              body: {
-                user_id: targetId,
-                plan_id: plan.id,
-                plan_title: plan.title,
-                demo_price: Number(plan.demo_price),
-                daily_income: Number(plan.daily_income),
-                validity_days: Number(plan.validity_days),
-                expires_at: expiresAt,
-              },
-            });
-            await sbRest(sb, 'demo_transactions', {
-              method: 'POST',
-              useService: true,
-              body: {
-                user_id: targetId,
-                type: 'plan_purchase',
-                amount: Number(plan.demo_price),
-                method: 'Admin VIP Assign',
-                reference_code: plan.title,
-                status: 'completed',
-                admin_note: `অ্যাডমিন থেকে ${plan.title} VIP প্যাকেজ যুক্ত হয়েছে`,
-                processed_by: isUuid(admin.uid) ? admin.uid : null,
-              },
-            });
-            await sbRest(sb, 'notifications', {
-              method: 'POST',
-              useService: true,
-              body: {
-                user_id: targetId,
-                title: 'অ্যাডমিন থেকে নতুন VIP প্ল্যান যুক্ত হয়েছে',
-                message: `আপনার অ্যাকাউন্টে "${plan.title}" প্ল্যানটি সফলভাবে যুক্ত করা হয়েছে।`,
-                category: 'system',
-              },
-            });
-            return jsonResponse({ ok: true, product: prodRes.data?.[0] });
+            plan = planRes.data?.[0];
+          } else {
+            plan = DEFAULT_PLANS.find((p) => p.id === planId);
           }
+          if (!plan) {
+            return jsonResponse({ error: 'নির্বাচিত প্ল্যানটি পাওয়া যায়নি।' }, 404);
+          }
+          if (tier) {
+            const tierRes = await sbRest(sb, `profiles?id=eq.${encodeURIComponent(targetId)}`, {
+              method: 'PATCH',
+              useService: true,
+              body: { tier, updated_at: nowIso },
+            });
+            if (tierRes.error) {
+              return jsonResponse({ error: tierRes.error }, 400);
+            }
+          }
+          const expiresAt = new Date(Date.now() + Number(plan.validity_days) * 86400000).toISOString();
+          const prodRes = await sbRest<WorkerUserProduct[]>(sb, 'demo_user_products', {
+            method: 'POST',
+            useService: true,
+            prefer: 'return=representation',
+            body: {
+              user_id: targetId,
+              plan_id: isUuid(plan.id) ? plan.id : null,
+              plan_title: plan.title,
+              demo_price: Number(plan.demo_price),
+              daily_income: Number(plan.daily_income),
+              validity_days: Number(plan.validity_days),
+              expires_at: expiresAt,
+            },
+          });
+          if (prodRes.error) {
+            return jsonResponse({ error: prodRes.error }, 400);
+          }
+          await sbRest(sb, 'demo_transactions', {
+            method: 'POST',
+            useService: true,
+            body: {
+              user_id: targetId,
+              type: 'plan_purchase',
+              amount: Number(plan.demo_price),
+              method: 'Admin VIP Assign',
+              reference_code: plan.title,
+              status: 'completed',
+              admin_note: `অ্যাডমিন থেকে ${plan.title} VIP প্যাকেজ যুক্ত হয়েছে`,
+              processed_by: isUuid(admin.uid) ? admin.uid : null,
+            },
+          });
+          await sbRest(sb, 'notifications', {
+            method: 'POST',
+            useService: true,
+            body: {
+              user_id: targetId,
+              title: 'অ্যাডমিন থেকে নতুন VIP প্ল্যান যুক্ত হয়েছে',
+              message: `আপনার অ্যাকাউন্টে "${plan.title}" প্ল্যানটি সফলভাবে যুক্ত করা হয়েছে।`,
+              category: 'system',
+            },
+          });
+          if (isUuid(admin.uid)) {
+            await sbRest(sb, 'admin_audit_logs', {
+              method: 'POST',
+              useService: true,
+              body: {
+                admin_id: admin.uid,
+                action: 'admin_assign_vip_plan',
+                target_table: 'demo_user_products',
+                target_id: targetId,
+                details: { planId: plan.id, planTitle: plan.title, tier },
+              },
+            });
+          }
+          return jsonResponse({ ok: true, product: prodRes.data?.[0] });
         }
       }
 
